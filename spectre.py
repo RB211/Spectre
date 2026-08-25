@@ -13,14 +13,24 @@ reason its arenas read as places rather than diagrams.
     W / up      drive              space   fire
     S / down    reverse            shift   turbo
     A D / left right   turn        tab     radar range
-    p  pause    f  fullscreen      esc / q  quit
+    p  pause    f  fullscreen      esc  menu (main menu / quit)
+
+LAN play: one machine picks HOST A LAN GAME and reads out the address the
+lobby shows; the others pick JOIN A LAN GAME and type it in (port 35700).
+Everyone waits in the lobby until the host presses enter, then it is the
+same arena for all of you -- shared flags, shared clock, and the enemy
+tanks come for whoever is nearest.
 """
 
+import json
 import math
 import os
+import queue
 import random
+import socket
 import struct
 import sys
+import threading
 
 # Name the window before SDL loads, so a tiling compositor has something
 # stable to hang a rule on (Hyprland: class:^(spectre)$).
@@ -74,6 +84,16 @@ COL_HUD = (110, 255, 175)
 COL_WARN = (255, 115, 95)
 COL_STAR = (38, 50, 76)
 COL_WHITE = (235, 255, 245)
+
+# LAN play: one machine hosts and owns the world, everyone else drives a
+# tank in it.  Messages are one JSON object per line over TCP -- at LAN
+# latencies the simplicity is worth far more than the bytes.
+PORT = 35700
+MAX_PLAYERS = 4
+SNAP_DT = 1.0 / 20.0            # host world snapshots
+POSE_DT = 1.0 / 30.0            # everyone's own-tank reports
+PLAYER_COLS = (COL_HUD, (255, 190, 90), (140, 175, 255), (255, 135, 205))
+SHOT_COLS = (COL_SHOT, COL_ESHOT, COL_SENTRY)
 
 TAU = math.pi * 2
 
@@ -714,9 +734,10 @@ def line_blocked(x0, z0, x1, z1, buildings, step=3.5):
 
 class Shell:
     __slots__ = ("x", "y", "z", "dx", "dz", "speed", "life", "friendly",
-                 "damage", "color")
+                 "damage", "color", "owner")
 
-    def __init__(self, x, y, z, dx, dz, friendly, damage, color, speed=SHOT_SPEED):
+    def __init__(self, x, y, z, dx, dz, friendly, damage, color,
+                 speed=SHOT_SPEED, owner=-1):
         self.x, self.y, self.z = x, y, z
         self.dx, self.dz = dx, dz
         self.speed = speed
@@ -724,6 +745,7 @@ class Shell:
         self.friendly = friendly
         self.damage = damage
         self.color = color
+        self.owner = owner
 
     def step(self, dt):
         self.x += self.dx * self.speed * dt
@@ -854,8 +876,7 @@ class Enemy(Tank):
         self.dodge = random.choice((-1.0, 1.0))
         self.dodge_t = 0.0
 
-    def think(self, dt, game):
-        p = game.player
+    def think(self, dt, game, p):
         dx, dz = p.x - self.x, p.z - self.z
         dist = math.hypot(dx, dz) or 1e-6
         spec = self.spec
@@ -907,6 +928,7 @@ class Enemy(Tank):
                                  dx, dz, False, spec["damage"], spec["shot"],
                                  spec["speed"]))
         game.play_at("efire", self.x, self.z)
+        game.net_fx("efire", self.x, self.z)
 
 
 class Player(Tank):
@@ -1199,6 +1221,176 @@ class Audio:
             self.band = -1
 
 
+# ---------------------------------------------------------------- network --
+# One machine hosts and owns the world -- the enemies, the shells, the
+# prizes, the clock.  Every player, host included, drives their own tank
+# locally (so the controls never feel the wire) and reports where it is;
+# the host aims the enemies at whoever is nearest and streams the world
+# back.  Arenas are never sent at all: a level is a seed, and every
+# machine grows the same buildings from it.
+
+
+def lan_ip():
+    """The address the LAN sees, found by aiming a datagram and reading
+    the return address off the envelope.  Nothing is actually sent."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+class Peer:
+    """One connected socket: a reader thread feeding a queue, and a lock
+    around sends so whole lines leave in one piece."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.pid = -1
+        self.name = ""
+        self.alive = True
+        self.inbox = queue.Queue()
+        self.lock = threading.Lock()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        buf = b""
+        try:
+            while True:
+                data = self.sock.recv(4096)
+                if not data:
+                    break
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if line:
+                        try:
+                            self.inbox.put(json.loads(line))
+                        except ValueError:
+                            pass
+        except OSError:
+            pass
+        self.alive = False
+        self.inbox.put(None)                     # the hang-up marker
+
+    def poll(self):
+        """Everything that has arrived; ends with None if the line died."""
+        out = []
+        while True:
+            try:
+                out.append(self.inbox.get_nowait())
+            except queue.Empty:
+                return out
+
+    def send(self, msg):
+        if not self.alive:
+            return
+        data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+        try:
+            with self.lock:
+                self.sock.sendall(data)
+        except OSError:
+            self.alive = False
+
+    def close(self):
+        self.alive = False
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.sock.close()
+
+
+class HostNet:
+    """Listens for tanks, hands each one a player id, fans messages out."""
+
+    def __init__(self, port=PORT):
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("", port))
+        self.sock.listen(4)
+        self.ip = lan_ip()
+        self.peers = {}                          # pid -> Peer
+        self.joins = queue.Queue()
+        self.next_pid = 1                        # 0 is the host
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                sock, _ = self.sock.accept()
+            except OSError:
+                return
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.joins.put(Peer(sock))
+
+    def admit(self):
+        """Fresh sockets: connected, but not yet introduced."""
+        out = []
+        while True:
+            try:
+                out.append(self.joins.get_nowait())
+            except queue.Empty:
+                return out
+
+    def broadcast(self, msg, skip=None):
+        for pid, peer in self.peers.items():
+            if pid != skip:
+                peer.send(msg)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        for peer in self.peers.values():
+            peer.close()
+
+
+def client_connect(addr, port=PORT, timeout=4.0):
+    sock = socket.create_connection((addr, port), timeout=timeout)
+    sock.settimeout(None)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return Peer(sock)
+
+
+class RemotePlayer:
+    """Someone else's tank: a pose that arrives over the wire, rolled
+    forward between reports so it moves like a tank, not a strobe."""
+
+    def __init__(self, pid, name):
+        self.pid, self.name = pid, name
+        self.color = PLAYER_COLS[pid % len(PLAYER_COLS)]
+        self.x = self.z = self.yaw = self.speed = 0.0
+        self.alive = True
+        self.score = 0
+        self.radius = 2.7
+        self.stale = 0.0                         # since the last pose
+
+    def pose(self, x, z, yaw, speed, alive, score):
+        self.x, self.z, self.yaw, self.speed = x, z, yaw, speed
+        self.alive, self.score = alive, score
+        self.stale = 0.0
+
+    @property
+    def forward(self):
+        return math.sin(self.yaw), math.cos(self.yaw)
+
+    def step(self, dt):
+        self.stale += dt
+        if self.alive and self.stale < 0.5:      # dead reckoning
+            self.x += math.sin(self.yaw) * self.speed * dt
+            self.z += math.cos(self.yaw) * self.speed * dt
+
+    def draw(self, view):
+        if self.alive:
+            view.shape(PLAYER_SHAPE, self.x, self.z, self.yaw, self.color,
+                       width=2, glow=True)
+
+
 # ------------------------------------------------------------------- game --
 
 class Game:
@@ -1229,35 +1421,67 @@ class Game:
         self.flags_taken = 0
         self.flags_needed = 0
 
+        # -- LAN state.  role is None (solo), "host" or "client".
+        self.role = None
+        self.net = None                  # HostNet, or the host's Peer
+        self.my_pid = 0
+        self.my_name = (os.environ.get("USER") or "player").upper()[:10]
+        self.remotes = {}                # pid -> RemotePlayer
+        self.pending = []                # host: sockets awaiting their hello
+        self.roster = []                 # lobby display: [pid, name] rows
+        self.menu_sel = 0
+        self.esc_prev = ("title", 0.0)   # where esc came from, to go back to
+        self.esc_sel = 0
+        self.quit = False                # the menu asks main() to stop
+        self.join_text = ""
+        self.join_err = ""
+        self.snap_t = 0.0
+        self.pose_t = 0.0
+        self.level_seed = 0
+        self.prize_seq = 0
+
     # -- building a level -------------------------------------------------
-    def free_spot(self, clear=7.0, away_from_start=22.0):
+    # A level is grown from a seed, so in LAN play the seed is the level:
+    # the host names a number and every machine builds the same arena.
+
+    def free_spot(self, rng, clear=7.0, away_from_start=22.0):
         for _ in range(400):
-            x = random.uniform(-ARENA + 12, ARENA - 12)
-            z = random.uniform(-ARENA + 12, ARENA - 12)
+            x = rng.uniform(-ARENA + 12, ARENA - 12)
+            z = rng.uniform(-ARENA + 12, ARENA - 12)
             if math.hypot(x, z) < away_from_start:
                 continue
             if any(b.blocks(x, z, clear) for b in self.buildings):
                 continue
             return x, z
-        return random.uniform(-40, 40), random.uniform(-40, 40)
+        return rng.uniform(-40, 40), rng.uniform(-40, 40)
 
-    def build_level(self):
+    def spawn_pose(self):
+        """Everyone gets their own patch of the cleared starting ground."""
+        spots = ((0.0, 0.0), (13.0, 0.0), (-13.0, 0.0), (0.0, -13.0))
+        x, z = spots[self.my_pid % len(spots)]
+        return x, z, 0.0
+
+    def build_level(self, seed=None):
+        if seed is None:
+            seed = random.randrange(1 << 30)
+        self.level_seed = seed
+        rng = random.Random(seed)
         n = self.level
         self.buildings = []
         want = min(34, 16 + n * 2)
         tries = 0
         while len(self.buildings) < want and tries < 900:
             tries += 1
-            x = random.uniform(-ARENA + 14, ARENA - 14)
-            z = random.uniform(-ARENA + 14, ARENA - 14)
+            x = rng.uniform(-ARENA + 14, ARENA - 14)
+            z = rng.uniform(-ARENA + 14, ARENA - 14)
             if math.hypot(x, z) < 26.0:                 # keep the spawn clear
                 continue
-            hx = random.uniform(3.0, 9.0)
-            hz = random.uniform(3.0, 9.0)
-            kind = random.choices(("block", "tower", "pyramid"),
-                                  (0.6, 0.25, 0.15))[0]
-            height = random.uniform(7.0, 24.0) if kind != "pyramid" else \
-                random.uniform(6.0, 14.0)
+            hx = rng.uniform(3.0, 9.0)
+            hz = rng.uniform(3.0, 9.0)
+            kind = rng.choices(("block", "tower", "pyramid"),
+                               (0.6, 0.25, 0.15))[0]
+            height = rng.uniform(7.0, 24.0) if kind != "pyramid" else \
+                rng.uniform(6.0, 14.0)
             if any(abs(x - b.x) < hx + b.hx + 9.0 and abs(z - b.z) < hz + b.hz + 9.0
                    for b in self.buildings):
                 continue
@@ -1265,32 +1489,42 @@ class Game:
 
         self.flags_needed = min(9, 3 + n)
         self.flags_taken = 0
-        self.prizes = [Prize(*self.free_spot(), "flag") for _ in range(self.flags_needed)]
+        self.prizes = [Prize(*self.free_spot(rng), "flag")
+                       for _ in range(self.flags_needed)]
         for _ in range(2 + n // 3):
-            self.prizes.append(Prize(*self.free_spot(), "ammo"))
+            self.prizes.append(Prize(*self.free_spot(rng), "ammo"))
         for _ in range(1 + n // 4):
-            self.prizes.append(Prize(*self.free_spot(), "shield"))
+            self.prizes.append(Prize(*self.free_spot(rng), "shield"))
+        for i, prize in enumerate(self.prizes):
+            prize.pid = i                    # so the wire can name them
+        self.prize_seq = len(self.prizes)
 
         self.enemies = []
-        for i in range(min(9, 1 + n)):
-            kind = "sentry" if (n >= 2 and i % 3 == 2) else "hunter"
-            while True:
-                x, z = self.free_spot(clear=6.0, away_from_start=60.0)
-                if math.hypot(x, z) > 55.0:
-                    break
-            self.enemies.append(Enemy(x, z, kind))
+        if self.role != "client":            # the host owns the enemies
+            for i in range(min(9, 1 + n)):
+                kind = "sentry" if (n >= 2 and i % 3 == 2) else "hunter"
+                while True:
+                    x, z = self.free_spot(rng, clear=6.0, away_from_start=60.0)
+                    if math.hypot(x, z) > 55.0:
+                        break
+                self.enemies.append(Enemy(x, z, kind))
 
         self.shells, self.bursts = [], []
         self.time_left = 100.0 + 12.0 * min(n, 6)
         self.warned = False
-        self.player.reset(0.0, 0.0, 0.0)
+        self.player.reset(*self.spawn_pose())
 
-    def new_game(self):
+    def new_game(self, seed=None, level=1):
         self.player = Player()
-        self.level = 1
-        self.build_level()
+        self.player.color = PLAYER_COLS[self.my_pid % len(PLAYER_COLS)]
+        self.level = level
+        self.build_level(seed)
+        for r in self.remotes.values():
+            r.pose(*((0.0,) * 4), True, 0)
+        self.snap_t = self.pose_t = 0.0
         self.state, self.state_t = "play", 0.0
-        self.say("LEVEL 1  --  COLLECT %d FLAGS" % self.flags_needed, 3.0)
+        self.say("LEVEL %d  --  COLLECT %d FLAGS"
+                 % (level, self.flags_needed), 3.0)
 
     def play_at(self, name, x, z, gain=1.0, reach=145.0):
         """Put a sound where it happened: quieter with distance, and over on
@@ -1311,17 +1545,60 @@ class Game:
     # -- input ------------------------------------------------------------
     def key(self, event):
         k = event.key
+        if self.state == "join_ip":
+            self.key_join(event)
+            return
+        if self.state == "escmenu":
+            if k in (pygame.K_UP, pygame.K_w, pygame.K_DOWN, pygame.K_s):
+                self.esc_sel = 1 - self.esc_sel
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                self.escmenu_act()
+            return
         if k == pygame.K_TAB:
             self.radar_range = {90.0: 150.0, 150.0: 55.0}.get(self.radar_range, 90.0)
-        elif k == pygame.K_p and self.state in ("play", "paused"):
+        elif k == pygame.K_p and self.role is None and self.state in ("play", "paused"):
             self.state = "paused" if self.state == "play" else "play"
+        elif self.state == "title" and k in (pygame.K_UP, pygame.K_w):
+            self.menu_sel = (self.menu_sel - 1) % 3
+        elif self.state == "title" and k in (pygame.K_DOWN, pygame.K_s):
+            self.menu_sel = (self.menu_sel + 1) % 3
         elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
             if self.state == "title":
-                self.new_game()
+                if self.menu_sel == 0:
+                    self.new_game()
+                elif self.menu_sel == 1:
+                    self.start_host()
+                else:
+                    self.join_err = ""
+                    self.state, self.state_t = "join_ip", 0.0
+            elif (self.state == "lobby" and self.role == "host"
+                  and k != pygame.K_SPACE):
+                self.net_start_level(1)
             elif self.state == "over":
-                self.state, self.state_t = "title", 0.0
+                if self.role == "host":
+                    self.net.broadcast({"t": "tolobby"})
+                    self.to_lobby()
+                elif self.role is None:
+                    self.state, self.state_t = "title", 0.0
             elif self.state == "clear" and self.state_t > 0.8:
-                self.next_level()
+                if self.role == "host":
+                    self.net_start_level(self.level + 1)
+                elif self.role is None:
+                    self.next_level()
+
+    def key_join(self, event):
+        """A line editor just big enough for an address."""
+        k = event.key
+        if k == pygame.K_ESCAPE:
+            self.state, self.state_t = "title", 0.0
+        elif k == pygame.K_BACKSPACE:
+            self.join_text = self.join_text[:-1]
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.connect_join()
+        else:
+            ch = event.unicode
+            if ch and (ch.isalnum() or ch in ".-:_") and len(self.join_text) < 40:
+                self.join_text += ch
 
     def fire(self):
         p = self.player
@@ -1334,8 +1611,14 @@ class Game:
         p.cool = SHOT_DELAY
         p.ammo -= 1
         dx, dz = p.forward
-        self.shells.append(Shell(p.x + dx * 3.6, 1.45, p.z + dz * 3.6, dx, dz,
-                                 True, SHOT_DAMAGE, COL_SHOT))
+        x, z = p.x + dx * 3.6, p.z + dz * 3.6
+        self.shells.append(Shell(x, 1.45, z, dx, dz, True, SHOT_DAMAGE,
+                                 COL_SHOT, owner=self.my_pid))
+        if self.role == "client":       # ours is cosmetic; the host's counts
+            self.net.send({"t": "fire", "x": round(x, 2), "z": round(z, 2),
+                           "dx": round(dx, 4), "dz": round(dz, 4)})
+        else:
+            self.net_fx("fire", x, z)
         p.kick = 0.045
         self.audio.play("fire")
 
@@ -1343,54 +1626,97 @@ class Game:
     def update(self, dt):
         self.state_t += dt
         self.msg_t = max(0.0, self.msg_t - dt)
+        if self.net:
+            self.net_pump(dt)
+            if self.net is None:            # the pump may have hung up
+                return
         if self.state != "play":
             self.audio.engine_stop()
-        if self.state == "title":
-            return
-        if self.state == "paused":
+        if self.state in ("title", "paused", "join_ip", "lobby"):
             return
         if self.state == "play":
             self.update_play(dt)
+        elif self.state == "escmenu":
+            if self.role is None:
+                return                      # solo: the world waits for you
+            if self.role == "host" and self.esc_prev[0] in ("play", "dead"):
+                self.update_play(dt)        # the others are still fighting
+            else:
+                self.step_ambient(dt)
         elif self.state in ("dead", "clear", "over"):
-            for lst in (self.shells, self.bursts):
-                lst[:] = [o for o in lst if o.step(dt)]
-            for e in self.enemies:
-                e.flash = max(0.0, e.flash - dt)
+            if self.role == "host" and self.state == "dead":
+                self.update_play(dt)        # the world must not die with us
+            else:
+                self.step_ambient(dt)
             if self.state == "dead" and self.state_t > 2.6:
                 self.respawn()
 
-    def update_play(self, dt):
-        p = self.player
-        keys = pygame.key.get_pressed()
-        if keys[pygame.K_SPACE]:
-            self.fire()
-        p.cool = max(0.0, p.cool - dt)
-        p.flash = max(0.0, p.flash - dt)
-        was = abs(p.speed)
-        if p.drive(dt, keys, self.buildings) and was > 16.0:
-            self.damage_player(2.5, shake=0.35)      # you felt that
-
+    def step_ambient(self, dt):
+        """Let what is already in flight land, without simulating anyone."""
+        for lst in (self.shells, self.bursts):
+            lst[:] = [o for o in lst if o.step(dt)]
         for e in self.enemies:
             e.flash = max(0.0, e.flash - dt)
-            e.think(dt, self)
-            dx, dz = p.x - e.x, p.z - e.z
-            d = math.hypot(dx, dz)
-            if d < e.radius + p.radius:                  # shunted apart
-                push = (e.radius + p.radius - d) * 0.5 + 0.01
-                nx, nz = dx / (d or 1.0), dz / (d or 1.0)
-                e.x -= nx * push
-                e.z -= nz * push
-                p.x += nx * push
-                p.z += nz * push
-                self.damage_player(24.0 * dt, shake=0.2)
+        for r in self.remotes.values():
+            r.step(dt)
+
+    def update_play(self, dt):
+        p = self.player
+        alive = self.state == "play"        # a dead host still runs the world
+        if alive:
+            keys = pygame.key.get_pressed()
+            if keys[pygame.K_SPACE]:
+                self.fire()
+            p.cool = max(0.0, p.cool - dt)
+            p.flash = max(0.0, p.flash - dt)
+            was = abs(p.speed)
+            if p.drive(dt, keys, self.buildings) and was > 16.0:
+                self.damage_player(2.5, shake=0.35)      # you felt that
+
+        for r in self.remotes.values():
+            r.step(dt)
+
+        if self.role == "client":
+            # These tanks are the host's: roll them forward between
+            # snapshots, and leave the thinking to the machine that owns them.
+            for e in self.enemies:
+                e.flash = max(0.0, e.flash - dt)
+                e.x += math.sin(e.yaw) * e.speed * dt
+                e.z += math.cos(e.yaw) * e.speed * dt
+        else:
+            targets = self.tanks_alive()
+            for e in self.enemies:
+                e.flash = max(0.0, e.flash - dt)
+                if targets:
+                    near = min(targets, key=lambda t:
+                               (t.x - e.x) ** 2 + (t.z - e.z) ** 2)
+                    e.think(dt, self, near)
+
+        if alive:
+            for e in self.enemies:                       # shunted apart
+                dx, dz = p.x - e.x, p.z - e.z
+                d = math.hypot(dx, dz)
+                if d < e.radius + p.radius:
+                    push = (e.radius + p.radius - d) * 0.5 + 0.01
+                    nx, nz = dx / (d or 1.0), dz / (d or 1.0)
+                    if self.role != "client":
+                        e.x -= nx * push
+                        e.z -= nz * push
+                    p.x += nx * push
+                    p.z += nz * push
+                    self.damage_player(24.0 * dt, shake=0.2)
 
         for prize in self.prizes:
             prize.step(dt)
         self.bursts[:] = [b for b in self.bursts if b.step(dt)]
-        self.update_shells(dt)
-        self.collect(dt)
+        if self.role == "client":
+            self.update_shells_client(dt)
+        else:
+            self.update_shells(dt)
+            self.collect(dt)
 
-        self.audio.engine(abs(p.speed) / P_TOP)
+        if alive:
+            self.audio.engine(abs(p.speed) / P_TOP)
 
         self.time_left -= dt
         if self.time_left < 20.0 and not self.warned:
@@ -1399,7 +1725,20 @@ class Game:
             self.say("TWENTY SECONDS", 2.0)
         if self.time_left <= 0.0:
             self.time_left = 0.0
-            self.kill_player("OUT OF TIME")
+            if self.role == "host":
+                self.net.broadcast({"t": "over", "why": "OUT OF TIME"})
+                self.best = max(self.best, p.score)
+                self.state, self.state_t = "over", 0.0
+                self.say("OUT OF TIME", 3.0)
+            elif self.role is None:
+                self.kill_player("OUT OF TIME")
+            # a client only coasts here: the word comes from the host
+
+    def tanks_alive(self):
+        """Every tank the enemies might care about, host's own included."""
+        out = [self.player] if self.state == "play" else []
+        out += [r for r in self.remotes.values() if r.alive]
+        return out
 
     def update_shells(self, dt):
         p = self.player
@@ -1416,7 +1755,7 @@ class Game:
                 for e in self.enemies:
                     if math.hypot(e.x - s.x, e.z - s.z) < e.radius + 0.8:
                         if e.hurt(s.damage):
-                            self.kill_enemy(e)
+                            self.kill_enemy(e, s.owner)
                         else:
                             self.play_at("hit", e.x, e.z)
                             self.bursts.append(Burst(s.x, 1.4, s.z, 0.4, s.color, 8, 0.35))
@@ -1425,7 +1764,43 @@ class Game:
                     live.append(s)
                     continue
                 continue
-            if math.hypot(p.x - s.x, p.z - s.z) < p.radius + 0.8:
+            if (self.state == "play"
+                    and math.hypot(p.x - s.x, p.z - s.z) < p.radius + 0.8):
+                self.bursts.append(Burst(s.x, 1.4, s.z, 0.5, COL_WARN, 10, 0.4))
+                self.damage_player(s.damage, shake=0.9)
+                continue
+            if any(r.alive and math.hypot(r.x - s.x, r.z - s.z) < r.radius + 0.8
+                   for r in self.remotes.values()):
+                # the hit player settles their own damage; we stop the shell
+                self.bursts.append(Burst(s.x, 1.4, s.z, 0.5, COL_WARN, 10, 0.4))
+                continue
+            live.append(s)
+        self.shells = live
+
+    def update_shells_client(self, dt):
+        """Shells here are the host's word made visible: our own fly
+        locally for feel, the rest arrive by snapshot.  Sparks and sounds
+        are drawn where they seem to land; the damage that matters to us --
+        an enemy shell into our own hull -- is judged here, because only
+        this machine knows exactly where our tank is."""
+        p = self.player
+        live = []
+        for s in self.shells:
+            if not s.step(dt):
+                self.bursts.append(Burst(s.x, s.y, s.z, 0.35, s.color, 7, 0.35))
+                continue
+            if any(b.blocks(s.x, s.z, 0.3) and s.y < b.h for b in self.buildings):
+                self.bursts.append(Burst(s.x, s.y, s.z, 0.5, s.color, 9, 0.4))
+                self.play_at("ricochet", s.x, s.z, 0.8)
+                continue
+            if s.friendly:
+                if any(math.hypot(e.x - s.x, e.z - s.z) < e.radius + 0.8
+                       for e in self.enemies):
+                    self.play_at("hit", s.x, s.z)
+                    self.bursts.append(Burst(s.x, 1.4, s.z, 0.4, s.color, 8, 0.35))
+                    continue
+            elif (self.state == "play"
+                  and math.hypot(p.x - s.x, p.z - s.z) < p.radius + 0.8):
                 self.bursts.append(Burst(s.x, 1.4, s.z, 0.5, COL_WARN, 10, 0.4))
                 self.damage_player(s.damage, shake=0.9)
                 continue
@@ -1433,32 +1808,57 @@ class Game:
         self.shells = live
 
     def collect(self, dt):
+        """Pickups, judged where the world lives.  The host reads every
+        tank against every prize -- its own precisely, the others from
+        their latest reports, which at LAN latencies is close enough to
+        drive over a flag with."""
         p = self.player
+        takers = [(self.my_pid, p)] if self.state == "play" else []
+        takers += [(pid, r) for pid, r in self.remotes.items() if r.alive]
         keep = []
         for prize in self.prizes:
-            if math.hypot(prize.x - p.x, prize.z - p.z) > p.radius + 2.6:
+            by = next((pid for pid, t in takers
+                       if math.hypot(prize.x - t.x, prize.z - t.z)
+                       <= t.radius + 2.6), None)
+            if by is None:
                 keep.append(prize)
                 continue
             if prize.kind == "flag":
                 self.flags_taken += 1
-                p.score += 250
-                p.ammo += 5
+            if self.role == "host":
+                self.net.broadcast({"t": "prize", "id": prize.pid, "by": by,
+                                    "ft": self.flags_taken})
+            left = self.flags_needed - self.flags_taken
+            if by == self.my_pid:
+                if prize.kind == "flag":
+                    p.score += 250
+                    p.ammo += 5
+                    self.audio.play("flag")
+                    self.say("FLAG SECURED  --  %d TO GO" % left if left else
+                             "ALL FLAGS SECURED", 1.6)
+                elif prize.kind == "ammo":
+                    p.ammo += 20
+                    self.audio.play("pod")
+                    self.say("AMMUNITION +20", 1.2)
+                else:
+                    p.shields = min(SHIELD_MAX, p.shields + 35.0)
+                    self.audio.play("pod")
+                    self.say("SHIELDS RESTORED", 1.2)
+            elif prize.kind == "flag":
                 self.audio.play("flag")
-                left = self.flags_needed - self.flags_taken
-                self.say("FLAG SECURED  --  %d TO GO" % left if left else
-                         "ALL FLAGS SECURED", 1.6)
-            elif prize.kind == "ammo":
-                p.ammo += 20
-                self.audio.play("pod")
-                self.say("AMMUNITION +20", 1.2)
-            else:
-                p.shields = min(SHIELD_MAX, p.shields + 35.0)
-                self.audio.play("pod")
-                self.say("SHIELDS RESTORED", 1.2)
+                self.say("%s TOOK A FLAG  --  %d TO GO" % (self.who(by), left)
+                         if left else "ALL FLAGS SECURED", 1.6)
             self.bursts.append(Burst(prize.x, 1.6, prize.z, 0.35, prize.color, 10, 0.5))
         self.prizes = keep
-        if self.flags_taken >= self.flags_needed and self.state == "play":
+        if (self.flags_taken >= self.flags_needed and self.role != "client"
+                and self.state in ("play", "dead", "escmenu")):
             self.finish_level()
+
+    def who(self, pid):
+        if pid == self.my_pid:
+            return self.my_name
+        r = self.remotes.get(pid)
+        return r.name if r else "A TANK"
 
     def damage_player(self, amount, shake=0.5):
         p = self.player
@@ -1473,74 +1873,424 @@ class Game:
             p.shields = 0.0
             self.kill_player("TANK DESTROYED")
 
-    def kill_enemy(self, enemy):
+    def kill_enemy(self, enemy, owner=0):
         self.enemies.remove(enemy)
-        self.player.score += enemy.spec["score"]
+        if owner == self.my_pid:
+            self.player.score += enemy.spec["score"]
+        elif self.role == "host" and owner in self.net.peers:
+            self.net.peers[owner].send({"t": "score", "v": enemy.spec["score"]})
         self.bursts.append(Burst(enemy.x, 1.5, enemy.z, 1.25, enemy.color, 22, 1.0))
         self.play_at("boom", enemy.x, enemy.z)
+        self.net_fx("boom", enemy.x, enemy.z, enemy.color)
         if random.random() < 0.45:
-            self.prizes.append(Prize(enemy.x, enemy.z,
-                                     "ammo" if random.random() < 0.6 else "shield"))
+            prize = Prize(enemy.x, enemy.z,
+                          "ammo" if random.random() < 0.6 else "shield")
+            prize.pid = self.prize_seq
+            self.prize_seq += 1
+            self.prizes.append(prize)
+            if self.role == "host":
+                self.net.broadcast({"t": "pspawn", "id": prize.pid,
+                                    "k": prize.kind, "x": round(prize.x, 1),
+                                    "z": round(prize.z, 1)})
 
     def kill_player(self, why):
         p = self.player
         self.bursts.append(Burst(p.x, 1.6, p.z, 1.6, COL_WARN, 28, 1.3))
         self.audio.play("doom")
         self.audio.engine_stop()
-        p.lives -= 1
+        if self.role is None:
+            p.lives -= 1              # on the LAN a tank is only ever mislaid
+        elif self.role == "host":
+            self.net_fx("die", p.x, p.z)
         self.say(why, 2.4)
         self.state, self.state_t = "dead", 0.0
 
     def respawn(self):
         p = self.player
-        if p.lives <= 0:
+        if self.role is None and p.lives <= 0:
             self.best = max(self.best, p.score)
             self.state, self.state_t = "over", 0.0
             return
-        p.reset(0.0, 0.0, 0.0)
+        p.reset(*self.spawn_pose())
         p.shields = SHIELD_MAX
         p.ammo = max(p.ammo, 12)
-        self.time_left = max(self.time_left, 35.0)
-        self.shells = []
+        if self.role is None:
+            self.time_left = max(self.time_left, 35.0)
+            self.shells = []
         for e in self.enemies:                       # give the player a moment
-            if math.hypot(e.x, e.z) < 45.0:
+            if math.hypot(e.x - p.x, e.z - p.z) < 45.0 and self.role != "client":
                 a = math.atan2(e.x, e.z)
                 e.x, e.z = math.sin(a) * 70.0, math.cos(a) * 70.0
         self.state, self.state_t = "play", 0.0
-        self.say("%d TANK%s LEFT" % (p.lives, "" if p.lives == 1 else "S"), 2.0)
+        if self.role is None:
+            self.say("%d TANK%s LEFT" % (p.lives, "" if p.lives == 1 else "S"), 2.0)
+        else:
+            self.say("BACK IN THE FIGHT", 2.0)
 
     def finish_level(self):
         self.bonus = int(self.time_left) * 10 + 500
         self.player.score += self.bonus
+        if self.role == "host":
+            self.net.broadcast({"t": "clear", "b": self.bonus})
         self.state, self.state_t = "clear", 0.0
         self.audio.play("clear")
 
-    def next_level(self):
-        self.level += 1
-        self.build_level()
+    def next_level(self, seed=None, level=None):
+        self.level = level if level is not None else self.level + 1
+        self.build_level(seed)
         self.player.shields = min(SHIELD_MAX, self.player.shields + 30.0)
         self.state, self.state_t = "play", 0.0
         self.say("LEVEL %d  --  COLLECT %d FLAGS" % (self.level, self.flags_needed), 3.0)
+
+    # -- LAN plumbing -----------------------------------------------------
+    def start_host(self):
+        try:
+            self.net = HostNet()
+        except OSError as err:
+            self.say("CANNOT HOST -- %s"
+                     % (err.strerror or str(err)).upper(), 3.0)
+            return
+        self.role, self.my_pid = "host", 0
+        self.remotes, self.pending = {}, []
+        self.roster = [[0, self.my_name]]
+        self.state, self.state_t = "lobby", 0.0
+
+    def connect_join(self):
+        addr, port = self.join_text.strip() or "127.0.0.1", PORT
+        if ":" in addr:
+            addr, _, tail = addr.rpartition(":")
+            try:
+                port = int(tail)
+            except ValueError:
+                port = PORT
+        try:
+            self.net = client_connect(addr, port)
+        except OSError:
+            self.net = None
+            self.join_err = "NO ANSWER FROM %s" % addr.upper()
+            return
+        self.role = "client"
+        self.net.send({"t": "hello", "name": self.my_name, "v": 1})
+        self.remotes, self.roster = {}, []
+        self.state, self.state_t = "lobby", 0.0
+
+    def to_lobby(self):
+        self.state, self.state_t = "lobby", 0.0
+
+    def leave_net(self, why=""):
+        if self.net:
+            self.net.close()
+        self.net, self.role, self.my_pid = None, None, 0
+        self.remotes, self.pending, self.roster = {}, [], []
+        self.state, self.state_t = "title", 0.0
+        if why:
+            self.say(why, 3.5)
+
+    def escape(self):
+        """Esc from somewhere networked: back out one step, quietly."""
+        if self.state == "join_ip":
+            self.state, self.state_t = "title", 0.0
+        elif self.net:
+            if self.role == "host":
+                self.net.broadcast({"t": "bye"})
+            self.leave_net()
+
+    def toggle_escmenu(self):
+        """Esc mid-game: raise the menu, or fold it away again.  Solo, the
+        world holds its breath underneath; on the LAN it plays on."""
+        if self.state == "escmenu":
+            self.state, self.state_t = self.esc_prev
+        else:
+            self.esc_prev = (self.state, self.state_t)
+            self.esc_sel = 0
+            self.state, self.state_t = "escmenu", 0.0
+
+    def escmenu_act(self):
+        if self.esc_sel == 0:                # back to the main menu
+            if self.net:
+                self.escape()
+            else:
+                self.best = max(self.best, self.player.score)
+                self.state, self.state_t = "title", 0.0
+        else:                                # quit
+            self.quit = True
+
+    def is_dead(self):
+        """Dead even while the esc menu is hiding the state that says so."""
+        return (self.state == "dead"
+                or (self.state == "escmenu" and self.esc_prev[0] == "dead"))
+
+    def net_fx(self, kind, x, z, color=None, skip=None):
+        """Tell the clients something flashed or banged.  Host only; solo
+        and client calls fall straight through."""
+        if self.role != "host":
+            return
+        msg = {"t": "fx", "k": kind, "x": round(x, 1), "z": round(z, 1)}
+        if color:
+            msg["c"] = list(color)
+        self.net.broadcast(msg, skip=skip)
+
+    def net_start_level(self, level):
+        seed = random.randrange(1 << 30)
+        self.net.broadcast({"t": "start", "seed": seed, "level": level})
+        if level <= 1:
+            self.new_game(seed, 1)
+        else:
+            self.next_level(seed, level)
+
+    def net_pump(self, dt):
+        if self.role == "host":
+            self.host_pump(dt)
+        elif self.role == "client":
+            self.client_pump(dt)
+
+    # -- the host's half --------------------------------------------------
+    def host_pump(self, dt):
+        net = self.net
+        for peer in net.admit():                     # newcomers knock
+            if self.state == "lobby" and len(net.peers) < MAX_PLAYERS - 1:
+                self.pending.append(peer)
+            else:
+                peer.send({"t": "no", "why": "GAME IN PROGRESS"
+                           if self.state != "lobby" else "GAME IS FULL"})
+                peer.close()
+        for peer in self.pending[:]:                 # then introduce themselves
+            for msg in peer.poll():
+                if msg is None:
+                    self.pending.remove(peer)
+                    break
+                if isinstance(msg, dict) and msg.get("t") == "hello":
+                    self.pending.remove(peer)
+                    peer.pid, net.next_pid = net.next_pid, net.next_pid + 1
+                    peer.name = (str(msg.get("name", ""))[:10].upper()
+                                 or "TANK %d" % peer.pid)
+                    net.peers[peer.pid] = peer
+                    self.remotes[peer.pid] = RemotePlayer(peer.pid, peer.name)
+                    peer.send({"t": "you", "id": peer.pid})
+                    self.send_roster()
+                    self.say("%s JOINED" % peer.name, 2.0)
+                    break
+        for pid, peer in list(net.peers.items()):
+            for msg in peer.poll():
+                if msg is None:
+                    del net.peers[pid]
+                    gone = self.remotes.pop(pid, None)
+                    self.send_roster()
+                    self.say("%s LEFT" % (gone.name if gone else "A TANK"), 2.5)
+                    break
+                if isinstance(msg, dict):
+                    self.host_msg(pid, msg)
+        if self.state in ("play", "dead", "clear", "escmenu"):
+            self.snap_t += dt
+            if self.snap_t >= SNAP_DT:
+                self.snap_t = 0.0
+                self.send_snapshot()
+
+    def send_roster(self):
+        self.roster = ([[0, self.my_name]]
+                       + [[p, r.name] for p, r in sorted(self.remotes.items())])
+        self.net.broadcast({"t": "roster", "pl": self.roster})
+
+    def host_msg(self, pid, msg):
+        t = msg.get("t")
+        r = self.remotes.get(pid)
+        if r is None:
+            return
+        if t == "p":
+            was = r.alive
+            r.pose(msg["x"], msg["z"], msg["yaw"], msg["sp"],
+                   bool(msg["al"]), msg["sc"])
+            if was and not r.alive:              # they were just blown apart
+                self.bursts.append(Burst(r.x, 1.6, r.z, 1.6, COL_WARN, 28, 1.3))
+                self.play_at("boom", r.x, r.z)
+                self.net_fx("die", r.x, r.z, skip=pid)
+        elif t == "fire":
+            self.shells.append(Shell(msg["x"], 1.45, msg["z"], msg["dx"],
+                                     msg["dz"], True, SHOT_DAMAGE, COL_SHOT,
+                                     owner=pid))
+            self.play_at("fire", msg["x"], msg["z"])
+            self.net_fx("fire", msg["x"], msg["z"], skip=pid)
+
+    def send_snapshot(self):
+        p = self.player
+        pl = [[0, round(p.x, 2), round(p.z, 2), round(p.yaw, 3),
+               round(p.speed, 2), int(not self.is_dead()), p.score]]
+        pl += [[pid, round(r.x, 2), round(r.z, 2), round(r.yaw, 3),
+                round(r.speed, 2), int(r.alive), r.score]
+               for pid, r in self.remotes.items()]
+        en = [[0 if e.kind == "hunter" else 1, round(e.x, 2), round(e.z, 2),
+               round(e.yaw, 3), round(e.speed, 2), int(e.flash > 0.0)]
+              for e in self.enemies]
+        sh = [[s.owner, round(s.x, 2), round(s.y, 2), round(s.z, 2),
+               round(s.dx, 3), round(s.dz, 3), s.speed, s.damage,
+               SHOT_COLS.index(s.color) if s.color in SHOT_COLS else 0]
+              for s in self.shells]
+        self.net.broadcast({"t": "s", "tl": round(self.time_left, 1),
+                            "ft": self.flags_taken, "pl": pl, "en": en,
+                            "sh": sh})
+
+    # -- the client's half ------------------------------------------------
+    def client_pump(self, dt):
+        for msg in self.net.poll():
+            if msg is None:
+                self.leave_net("CONNECTION LOST")
+                return
+            if isinstance(msg, dict):
+                self.client_msg(msg)
+                if self.net is None:             # told to go home
+                    return
+        if self.state in ("play", "dead", "clear", "escmenu"):
+            self.pose_t += dt
+            if self.pose_t >= POSE_DT:
+                self.pose_t = 0.0
+                p = self.player
+                self.net.send({"t": "p", "x": round(p.x, 2),
+                               "z": round(p.z, 2), "yaw": round(p.yaw, 3),
+                               "sp": round(p.speed, 2),
+                               "al": int(not self.is_dead()),
+                               "sc": p.score})
+
+    def client_msg(self, msg):
+        t = msg.get("t")
+        if t == "s":
+            self.apply_snapshot(msg)
+        elif t == "fx":
+            self.apply_fx(msg)
+        elif t == "you":
+            self.my_pid = msg["id"]
+        elif t == "roster":
+            self.roster = msg["pl"]
+            names = {pid: name for pid, name in self.roster}
+            for pid in [q for q in self.remotes if q not in names]:
+                gone = self.remotes.pop(pid)
+                if self.state != "lobby":
+                    self.say("%s LEFT" % gone.name, 2.5)
+            for pid, name in names.items():
+                if pid != self.my_pid and pid not in self.remotes:
+                    self.remotes[pid] = RemotePlayer(pid, name)
+        elif t == "start":
+            if msg["level"] <= 1:
+                self.new_game(msg["seed"], 1)
+            else:
+                self.next_level(msg["seed"], msg["level"])
+        elif t == "prize":
+            self.prize_event(msg)
+        elif t == "pspawn":
+            prize = Prize(msg["x"], msg["z"], msg["k"])
+            prize.pid = msg["id"]
+            self.prizes.append(prize)
+        elif t == "score":
+            self.player.score += msg["v"]
+        elif t == "clear":
+            self.bonus = msg["b"]
+            self.player.score += self.bonus
+            self.state, self.state_t = "clear", 0.0
+            self.audio.play("clear")
+        elif t == "over":
+            self.best = max(self.best, self.player.score)
+            self.state, self.state_t = "over", 0.0
+            self.say(msg.get("why", ""), 3.0)
+        elif t == "tolobby":
+            self.to_lobby()
+        elif t == "no":
+            self.leave_net(msg.get("why", "REFUSED"))
+        elif t == "bye":
+            self.leave_net("HOST LEFT")
+
+    def apply_snapshot(self, msg):
+        self.time_left = msg["tl"]
+        self.flags_taken = msg["ft"]
+        for pid, x, z, yaw, sp, al, sc in msg["pl"]:
+            r = self.remotes.get(pid)
+            if r:
+                r.pose(x, z, yaw, sp, bool(al), sc)
+        ghosts = []
+        for k, x, z, yaw, sp, fl in msg["en"]:
+            spec = HUNTER if k == 0 else SENTRY
+            g = Tank(x, z, yaw, spec["shape"], spec["color"], spec["radius"])
+            g.kind = "hunter" if k == 0 else "sentry"
+            g.speed = sp
+            g.flash = 0.08 if fl else 0.0
+            ghosts.append(g)
+        self.enemies = ghosts
+        mine = [s for s in self.shells
+                if s.friendly and s.owner == self.my_pid]
+        for owner, x, y, z, dx, dz, sp, dmg, ci in msg["sh"]:
+            if owner != self.my_pid:             # ours already fly locally
+                mine.append(Shell(x, y, z, dx, dz, owner >= 0, dmg,
+                                  SHOT_COLS[ci % len(SHOT_COLS)], sp, owner))
+        self.shells = mine
+
+    def apply_fx(self, msg):
+        k, x, z = msg["k"], msg["x"], msg["z"]
+        col = tuple(msg["c"]) if "c" in msg else COL_SHOT
+        if k in ("fire", "efire"):
+            self.play_at(k, x, z)
+        elif k == "boom":
+            self.bursts.append(Burst(x, 1.5, z, 1.25, col, 22, 1.0))
+            self.play_at("boom", x, z)
+        elif k == "die":
+            self.bursts.append(Burst(x, 1.6, z, 1.6, COL_WARN, 28, 1.3))
+            self.play_at("boom", x, z)
+
+    def prize_event(self, msg):
+        prize = next((q for q in self.prizes
+                      if getattr(q, "pid", -1) == msg["id"]), None)
+        if prize is None:
+            return
+        self.prizes.remove(prize)
+        self.bursts.append(Burst(prize.x, 1.6, prize.z, 0.35,
+                                 prize.color, 10, 0.5))
+        self.flags_taken = msg["ft"]
+        by, mine = msg["by"], msg["by"] == self.my_pid
+        left = self.flags_needed - self.flags_taken
+        if prize.kind == "flag":
+            self.audio.play("flag")
+            if mine:
+                self.player.score += 250
+                self.player.ammo += 5
+            head = "FLAG SECURED" if mine else "%s TOOK A FLAG" % self.who(by)
+            self.say("%s  --  %d TO GO" % (head, left) if left else
+                     "ALL FLAGS SECURED", 1.6)
+        elif mine and prize.kind == "ammo":
+            self.player.ammo += 20
+            self.audio.play("pod")
+            self.say("AMMUNITION +20", 1.2)
+        elif mine:
+            self.player.shields = min(SHIELD_MAX, self.player.shields + 35.0)
+            self.audio.play("pod")
+            self.say("SHIELDS RESTORED", 1.2)
 
     # -- drawing ----------------------------------------------------------
     def draw(self):
         if self.state == "title":
             self.draw_title()
             return
+        if self.state in ("join_ip", "lobby"):
+            self.draw_net_screen()
+            return
         self.draw_world()
         self.draw_hud()
-        if self.state == "paused":
-            self.panel(["PAUSED"], ["p  resume     esc  quit"])
+        if self.state == "escmenu":
+            self.draw_escmenu()
+        elif self.state == "paused":
+            self.panel(["PAUSED"], ["p  resume     esc  menu"])
         elif self.state == "clear":
             self.panel(["LEVEL %d CLEAR" % self.level,
                         "BONUS %d" % self.bonus,
                         "SCORE %d" % self.player.score],
-                       ["enter  next level"])
+                       ["the host calls the next level" if self.role == "client"
+                        else "enter  next level"])
         elif self.state == "over":
+            if self.role == "host":
+                hint = "enter  back to lobby"
+            elif self.role == "client":
+                hint = "the host calls the lobby     esc  menu"
+            else:
+                hint = "enter  back to title"
             self.panel(["GAME OVER",
                         "SCORE %d" % self.player.score,
-                        "BEST %d" % self.best],
-                       ["enter  back to title"])
+                        "BEST %d" % self.best], [hint])
 
     def camera(self):
         p = self.player
@@ -1588,7 +2338,8 @@ class Game:
         for center, radius, segs in WALLS:
             queue.append(((center[0] - ex) ** 2 + (center[2] - ez) ** 2,
                           (center, radius, segs)))
-        for thing in self.buildings + self.prizes + self.enemies:
+        others = [r for r in self.remotes.values() if r.alive]
+        for thing in self.buildings + self.prizes + self.enemies + others:
             queue.append(((thing.x - ex) ** 2 + (thing.z - ez) ** 2, thing))
         for thing in self.shells + self.bursts:
             queue.append(((thing.x - ex) ** 2 + (thing.z - ez) ** 2, thing))
@@ -1645,11 +2396,20 @@ class Game:
 
         self.text("FLAGS %d/%d" % (self.flags_taken, self.flags_needed),
                   w - 18, base, self.mid, COL_FLAG, anchor="topright")
-        self.text("TANKS", w - 18, base + 30, self.small, anchor="topright")
-        for i in range(max(0, p.lives)):
-            x = w - 26 - i * 20
-            pygame.draw.polygon(surf, COL_HUD, ((x, base + 56), (x - 7, base + 68),
-                                                (x + 7, base + 68)), 1)
+        if self.role is None:
+            self.text("TANKS", w - 18, base + 30, self.small, anchor="topright")
+            for i in range(max(0, p.lives)):
+                x = w - 26 - i * 20
+                pygame.draw.polygon(surf, COL_HUD, ((x, base + 56), (x - 7, base + 68),
+                                                    (x + 7, base + 68)), 1)
+        else:                                  # the squadron, not the lives
+            rows = [(self.my_pid, self.my_name, p.score)]
+            rows += [(r.pid, r.name, r.score) for r in self.remotes.values()]
+            y = base + 28
+            for pid, name, score in sorted(rows):
+                self.text("%-10s %6d" % (name, score), w - 18, y, self.small,
+                          PLAYER_COLS[pid % len(PLAYER_COLS)], anchor="topright")
+                y += 18
         self.text("v view    tab radar    p pause", w - 18, h - 20, self.tiny,
                   (48, 96, 78), anchor="bottomright")
 
@@ -1715,10 +2475,37 @@ class Game:
                 x, y = int(q[0]), int(q[1])
                 pygame.draw.polygon(surf, e.color,
                                     ((x, y - 4), (x - 4, y + 3), (x + 4, y + 3)), 1)
+        for mate in self.remotes.values():
+            q = blip(mate.x, mate.z) if mate.alive else None
+            if q:
+                x, y = int(q[0]), int(q[1])
+                pygame.draw.polygon(surf, mate.color,
+                                    ((x, y - 4), (x - 4, y + 3), (x + 4, y + 3)), 1)
         pygame.draw.polygon(surf, COL_WHITE,
                             ((cx, cy - 5), (cx - 4, cy + 4), (cx + 4, cy + 4)), 1)
         self.text("%dm" % int(self.radar_range), cx + r - 2, cy + r - 12,
                   self.tiny, (48, 110, 88), anchor="topright")
+
+    def draw_escmenu(self):
+        surf, view = self.screen, self.view
+        w, h = view.w, view.h
+        box = pygame.Rect(0, 0, 460, 190)
+        box.center = (w // 2, int(h * 0.42))
+        shade = pygame.Surface(box.size, pygame.SRCALPHA)
+        shade.fill((4, 8, 12, 205))
+        surf.blit(shade, box.topleft)
+        pygame.draw.rect(surf, COL_HUD, box, 1)
+        items = ("BACK TO THE MAIN MENU", "QUIT SPECTRE")
+        y = box.top + 40
+        for i, item in enumerate(items):
+            on = i == self.esc_sel
+            label = ("> %s <" % item) \
+                if on and int(self.state_t * 2.5) % 2 == 0 else item
+            self.text(label, box.centerx, y, self.mid,
+                      COL_WHITE if on else (80, 190, 145), anchor="midtop")
+            y += 44
+        self.text("esc  back to the game", box.centerx, box.bottom - 32,
+                  self.small, (70, 170, 130), anchor="midtop")
 
     def panel(self, lines, hints=()):
         surf, view = self.screen, self.view
@@ -1764,20 +2551,77 @@ class Game:
         self.text("S P E C T R E", w / 2, h * 0.14, font(58), COL_HUD, anchor="midtop")
         self.text("wireframe tank arena", w / 2, h * 0.14 + 74, self.mid,
                   (70, 170, 130), anchor="midtop")
-        rows = ["W S  drive          A D  turn",
-                "space  fire         shift  turbo",
-                "v  view             tab  radar range",
-                "p  pause            esc  quit"]
-        y = h - 190
+        items = ("ONE PLAYER", "HOST A LAN GAME", "JOIN A LAN GAME")
+        y = h - 244
+        for i, item in enumerate(items):
+            on = i == self.menu_sel
+            label = ("> %s <" % item) if on and int(t * 2.5) % 2 == 0 else item
+            self.text(label, w / 2, y, self.mid,
+                      COL_WHITE if on else (80, 190, 145), anchor="midtop")
+            y += 32
+        rows = ["W S  drive    A D  turn    space  fire    shift  turbo",
+                "v  view    tab  radar    p  pause    esc  quit"]
+        y = h - 128
         for row in rows:
-            self.text(row, w / 2, y, self.small, (80, 190, 145), anchor="midtop")
+            self.text(row, w / 2, y, self.small, (70, 160, 125), anchor="midtop")
             y += 24
         if self.best:
-            self.text("BEST %d" % self.best, w / 2, h - 74, self.mid,
+            self.text("BEST %d" % self.best, w / 2, h - 70, self.mid,
                       COL_FLAG, anchor="midtop")
-        if int(t * 2.0) % 2:
-            self.text("PRESS ENTER TO DEPLOY", w / 2, h - 44, self.mid,
+        if self.msg_t > 0.0:                    # a word from the network
+            self.text(self.msg, w / 2, h - 40, self.small, COL_WARN,
+                      anchor="midtop")
+
+    def draw_net_screen(self):
+        """The address book and the lobby: flat screens, same wire art."""
+        view, surf = self.view, self.screen
+        surf.fill(COL_BG)
+        w, h = view.w, view.h
+        t = self.state_t
+        self.text("S P E C T R E", w / 2, h * 0.10, font(44), COL_HUD,
+                  anchor="midtop")
+        if self.state == "join_ip":
+            self.text("JOIN A LAN GAME", w / 2, h * 0.30, self.big,
                       COL_WHITE, anchor="midtop")
+            self.text("HOST ADDRESS", w / 2, h * 0.30 + 70, self.small,
+                      (80, 190, 145), anchor="midtop")
+            box = pygame.Rect(0, 0, 420, 40)
+            box.center = (w // 2, int(h * 0.30) + 118)
+            pygame.draw.rect(surf, COL_HUD, box, 1)
+            entry = self.join_text + ("_" if int(t * 2.5) % 2 else "")
+            self.text(entry or " ", box.centerx, box.centery, self.mid,
+                      COL_FLAG, anchor="center")
+            if self.join_err:
+                self.text(self.join_err, w / 2, box.bottom + 24, self.small,
+                          COL_WARN, anchor="midtop")
+            self.text("enter  connect     esc  back", w / 2, h - 60,
+                      self.small, (70, 170, 130), anchor="midtop")
+            return
+        # the lobby
+        self.text("LAN LOBBY", w / 2, h * 0.26, self.big, COL_WHITE,
+                  anchor="midtop")
+        if self.role == "host":
+            self.text("HOSTING ON %s  PORT %d" % (self.net.ip, PORT),
+                      w / 2, h * 0.26 + 56, self.small, COL_FLAG,
+                      anchor="midtop")
+        y = h * 0.26 + 110
+        for pid, name in self.roster or [[self.my_pid, self.my_name]]:
+            col = PLAYER_COLS[pid % len(PLAYER_COLS)]
+            tag = "  (you)" if pid == self.my_pid else ""
+            pygame.draw.polygon(surf, col,
+                                ((w / 2 - 120, y + 14), (w / 2 - 127, y + 26),
+                                 (w / 2 - 113, y + 26)), 1)
+            self.text("%s%s" % (name, tag), w / 2 - 95, y + 8, self.mid, col)
+            y += 40
+        if self.role == "host":
+            hint = "enter  launch     esc  close the lobby"
+            if len(self.roster) < 2 and int(t * 1.5) % 2:
+                self.text("WAITING FOR TANKS TO JOIN", w / 2, y + 18,
+                          self.small, (80, 190, 145), anchor="midtop")
+        else:
+            hint = "waiting for the host to launch     esc  leave"
+        self.text(hint, w / 2, h - 60, self.small, (70, 170, 130),
+                  anchor="midtop")
 
 
 def font(size):
@@ -1827,8 +2671,16 @@ def main(argv):
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_ESCAPE, pygame.K_q):
-                    running = False
+                if game.state == "join_ip":      # typing an address: letters
+                    game.key(event)              # are letters, esc backs out
+                elif event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    if game.state in ("play", "paused", "dead", "clear",
+                                      "over", "escmenu"):
+                        game.toggle_escmenu()    # raise the menu, or lower it
+                    elif game.net or game.state == "lobby":
+                        game.escape()            # leave the LAN, keep the app
+                    else:
+                        running = False          # esc on the title quits
                 elif event.key in (pygame.K_f, pygame.K_F11):
                     try:
                         pygame.display.toggle_fullscreen()
@@ -1842,12 +2694,18 @@ def main(argv):
         game.update(dt)
         game.draw()
         pygame.display.flip()
+        if game.quit:                            # the esc menu said so
+            running = False
 
         if frames is not None:
             frames -= 1
             if frames <= 0:
                 running = False
 
+    if game.net:                                 # hang up before leaving
+        if game.role == "host":
+            game.net.broadcast({"t": "bye"})
+        game.net.close()
     pygame.quit()
     return 0
 

@@ -24,7 +24,8 @@ pygame is installed for the **system** python here, not mise's:
 | `shift` | turbo (drains, refills when you let off) |
 | `v` | first-person / chase camera |
 | `tab` | radar range: 55m / 90m / 150m |
-| `p` `f` `esc` | pause, fullscreen, quit |
+| `p` `f` | pause, fullscreen |
+| `esc` | in-game menu — back to the main menu, or quit (on the title it quits) |
 
 Collect every flag in the arena before the clock runs out. Enemy tanks —
 fast red **hunters** and slow, hard-hitting purple **sentries** — hunt you
@@ -35,6 +36,25 @@ Clearing a level pays a time bonus and adds another tank to the arena.
 **Steering winds up.** A tap turns you about half a degree, for lining up a
 shot; hold the key and the rate climbs over about 0.85 s to a full 132°/s
 swing. Fine aim and fast turns off the same key, no modifier.
+
+## LAN play
+
+Co-op over the local network, up to four tanks, straight TCP on port 35700 —
+no accounts, no discovery service, just an address.
+
+- One machine picks **HOST A LAN GAME**; the lobby shows the address to read
+  out. The others pick **JOIN A LAN GAME** and type it in (`host:port` works
+  if you have moved the port). Everyone waits in the lobby until the host
+  presses `enter`.
+- The arena is never transmitted — a level is a **seed**, and every machine
+  grows the same buildings from it. The host owns the world (enemies, shells,
+  prizes, the clock) and streams it at 20 Hz; each player drives their own
+  tank locally and reports its pose at 30 Hz, so the controls never feel the
+  wire. Remote tanks are dead-reckoned between reports.
+- Flags and the clock are shared; scores are per player, and the enemy tanks
+  come for whoever is nearest. No friendly fire. Destroyed tanks respawn
+  after a moment — the mission only fails when the clock runs out, which
+  sends everyone back to the lobby for another go.
 
 ## Hyprland / Omarchy
 
