@@ -92,10 +92,41 @@ PORT = 35700
 MAX_PLAYERS = 4
 SNAP_DT = 1.0 / 20.0            # host world snapshots
 POSE_DT = 1.0 / 30.0            # everyone's own-tank reports
-PLAYER_COLS = (COL_HUD, (255, 190, 90), (140, 175, 255), (255, 135, 205))
+# Tank colors for LAN play: one per player, and none of them a color the
+# world already speaks -- walls are cyan, buildings green, towers olive,
+# hunters salmon, sentries lavender, prizes amber / ice / periwinkle.
+PLAYER_COLS = ((255, 145, 40),      # amber-orange
+               (80, 130, 255),      # cobalt
+               (255, 85, 170),      # rose
+               (165, 90, 255))      # violet
 SHOT_COLS = (COL_SHOT, COL_ESHOT, COL_SENTRY)
 
 TAU = math.pi * 2
+
+# The one thing worth remembering between sessions: what to call you.
+SETTINGS_PATH = os.path.expanduser("~/.config/spectre/settings.json")
+
+
+def default_name():
+    return (os.environ.get("USER") or "player").upper()[:10]
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data):
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass                       # a name that lasts one session, then
 
 # --------------------------------------------------------------- geometry --
 
@@ -458,6 +489,13 @@ class View:
             if px + r < 0.0 or px - r > self.w:
                 return False
         return True
+
+    def project(self, p):
+        """One world point onto the screen: (x, y, depth), or None."""
+        x, y, z = self.to_cam(p)
+        if z < NEAR or z > FAR:
+            return None
+        return (self.cx + x / z * self.f, self.cy - y / z * self.f, z)
 
     # -- drawing ----------------------------------------------------------
     def segments(self, segs, color, width=1, glow=False):
@@ -1315,8 +1353,13 @@ class HostNet:
         self.ip = lan_ip()
         self.peers = {}                          # pid -> Peer
         self.joins = queue.Queue()
-        self.next_pid = 1                        # 0 is the host
         threading.Thread(target=self._accept, daemon=True).start()
+
+    def free_pid(self):
+        """The lowest seat not taken -- 0 is the host's -- so a leaver's
+        color and spawn corner go back in the pool.  None if full up."""
+        taken = set(self.peers)
+        return next((p for p in range(1, MAX_PLAYERS) if p not in taken), None)
 
     def _accept(self):
         while True:
@@ -1402,6 +1445,8 @@ class Game:
         self.mid = font(20)
         self.small = font(14)
         self.tiny = font(11)
+        self.tag = font(42)              # call signs over tanks
+        self.tag_far = font(33)
         self.stars = []
         for _ in range(120):
             v = (random.uniform(-1, 1), random.uniform(.02, 1), random.uniform(-1, 1))
@@ -1425,7 +1470,9 @@ class Game:
         self.role = None
         self.net = None                  # HostNet, or the host's Peer
         self.my_pid = 0
-        self.my_name = (os.environ.get("USER") or "player").upper()[:10]
+        self.my_name = (str(load_settings().get("name", ""))[:10].upper()
+                        or default_name())
+        self.name_text = ""
         self.remotes = {}                # pid -> RemotePlayer
         self.pending = []                # host: sockets awaiting their hello
         self.roster = []                 # lobby display: [pid, name] rows
@@ -1548,6 +1595,9 @@ class Game:
         if self.state == "join_ip":
             self.key_join(event)
             return
+        if self.state == "settings":
+            self.key_settings(event)
+            return
         if self.state == "escmenu":
             if k in (pygame.K_UP, pygame.K_w, pygame.K_DOWN, pygame.K_s):
                 self.esc_sel = 1 - self.esc_sel
@@ -1559,18 +1609,21 @@ class Game:
         elif k == pygame.K_p and self.role is None and self.state in ("play", "paused"):
             self.state = "paused" if self.state == "play" else "play"
         elif self.state == "title" and k in (pygame.K_UP, pygame.K_w):
-            self.menu_sel = (self.menu_sel - 1) % 3
+            self.menu_sel = (self.menu_sel - 1) % 4
         elif self.state == "title" and k in (pygame.K_DOWN, pygame.K_s):
-            self.menu_sel = (self.menu_sel + 1) % 3
+            self.menu_sel = (self.menu_sel + 1) % 4
         elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
             if self.state == "title":
                 if self.menu_sel == 0:
                     self.new_game()
                 elif self.menu_sel == 1:
                     self.start_host()
-                else:
+                elif self.menu_sel == 2:
                     self.join_err = ""
                     self.state, self.state_t = "join_ip", 0.0
+                else:
+                    self.name_text = self.my_name
+                    self.state, self.state_t = "settings", 0.0
             elif (self.state == "lobby" and self.role == "host"
                   and k != pygame.K_SPACE):
                 self.net_start_level(1)
@@ -1599,6 +1652,21 @@ class Game:
             ch = event.unicode
             if ch and (ch.isalnum() or ch in ".-:_") and len(self.join_text) < 40:
                 self.join_text += ch
+
+    def key_settings(self, event):
+        k = event.key
+        if k == pygame.K_ESCAPE:
+            self.state, self.state_t = "title", 0.0
+        elif k == pygame.K_BACKSPACE:
+            self.name_text = self.name_text[:-1]
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.my_name = self.name_text.strip()[:10] or default_name()
+            save_settings({"name": self.my_name})
+            self.state, self.state_t = "title", 0.0
+        else:
+            ch = event.unicode
+            if ch and (ch.isalnum() or ch in "-_ ") and len(self.name_text) < 10:
+                self.name_text += ch.upper()
 
     def fire(self):
         p = self.player
@@ -2061,7 +2129,12 @@ class Game:
                     break
                 if isinstance(msg, dict) and msg.get("t") == "hello":
                     self.pending.remove(peer)
-                    peer.pid, net.next_pid = net.next_pid, net.next_pid + 1
+                    pid = net.free_pid()
+                    if pid is None:              # filled up while they knocked
+                        peer.send({"t": "no", "why": "GAME IS FULL"})
+                        peer.close()
+                        break
+                    peer.pid = pid
                     peer.name = (str(msg.get("name", ""))[:10].upper()
                                  or "TANK %d" % peer.pid)
                     net.peers[peer.pid] = peer
@@ -2269,6 +2342,9 @@ class Game:
         if self.state in ("join_ip", "lobby"):
             self.draw_net_screen()
             return
+        if self.state == "settings":
+            self.draw_settings()
+            return
         self.draw_world()
         self.draw_hud()
         if self.state == "escmenu":
@@ -2352,6 +2428,22 @@ class Game:
                 view.chunk(thing[0], thing[1], thing[2], COL_WALL)
             else:
                 thing.draw(view)
+
+        for r in self.remotes.values():          # call signs over the tanks
+            if not r.alive:
+                continue
+            q = view.project((r.x, 3.6, r.z))
+            if q is None:
+                continue
+            px, py, depth = q
+            if not (0.0 <= px < w and 0.0 <= py < h):
+                continue
+            k = (1.0 - depth / FAR) ** 0.8       # fade with the tank
+            if k <= 0.15:
+                continue
+            self.text(r.name, px, py,
+                      self.tag if depth < 45.0 else self.tag_far,
+                      tuple(int(c * k) for c in r.color), anchor="midbottom")
 
     # -- head-up display --------------------------------------------------
     def text(self, s, x, y, fnt, color=COL_HUD, anchor="topleft"):
@@ -2551,8 +2643,9 @@ class Game:
         self.text("S P E C T R E", w / 2, h * 0.14, font(58), COL_HUD, anchor="midtop")
         self.text("wireframe tank arena", w / 2, h * 0.14 + 74, self.mid,
                   (70, 170, 130), anchor="midtop")
-        items = ("ONE PLAYER", "HOST A LAN GAME", "JOIN A LAN GAME")
-        y = h - 244
+        items = ("ONE PLAYER", "HOST A LAN GAME", "JOIN A LAN GAME",
+                 "SETTINGS")
+        y = h - 276
         for i, item in enumerate(items):
             on = i == self.menu_sel
             label = ("> %s <" % item) if on and int(t * 2.5) % 2 == 0 else item
@@ -2623,6 +2716,29 @@ class Game:
         self.text(hint, w / 2, h - 60, self.small, (70, 170, 130),
                   anchor="midtop")
 
+    def draw_settings(self):
+        view, surf = self.view, self.screen
+        surf.fill(COL_BG)
+        w, h = view.w, view.h
+        t = self.state_t
+        self.text("S P E C T R E", w / 2, h * 0.10, font(44), COL_HUD,
+                  anchor="midtop")
+        self.text("SETTINGS", w / 2, h * 0.30, self.big, COL_WHITE,
+                  anchor="midtop")
+        self.text("PLAYER NAME", w / 2, h * 0.30 + 70, self.small,
+                  (80, 190, 145), anchor="midtop")
+        box = pygame.Rect(0, 0, 300, 40)
+        box.center = (w // 2, int(h * 0.30) + 118)
+        pygame.draw.rect(surf, COL_HUD, box, 1)
+        entry = self.name_text + ("_" if int(t * 2.5) % 2 else "")
+        self.text(entry or " ", box.centerx, box.centery, self.mid,
+                  COL_FLAG, anchor="center")
+        self.text("this is the name the lobby and the other tanks see",
+                  w / 2, box.bottom + 24, self.small, (70, 160, 125),
+                  anchor="midtop")
+        self.text("enter  save     esc  back", w / 2, h - 60,
+                  self.small, (70, 170, 130), anchor="midtop")
+
 
 def font(size):
     return pygame.font.SysFont(
@@ -2671,8 +2787,9 @@ def main(argv):
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
-                if game.state == "join_ip":      # typing an address: letters
-                    game.key(event)              # are letters, esc backs out
+                if game.state in ("join_ip", "settings"):
+                    game.key(event)              # typing: letters are letters,
+                                                 # esc backs out
                 elif event.key in (pygame.K_ESCAPE, pygame.K_q):
                     if game.state in ("play", "paused", "dead", "clear",
                                       "over", "escmenu"):

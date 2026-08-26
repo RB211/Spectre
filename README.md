@@ -55,6 +55,10 @@ no accounts, no discovery service, just an address.
   come for whoever is nearest. No friendly fire. Destroyed tanks respawn
   after a moment — the mission only fails when the clock runs out, which
   sends everyone back to the lobby for another go.
+- Every other tank flies its player's name over the turret, in that player's
+  color, fading with distance like everything else. Set yours under
+  **SETTINGS** on the title screen (it defaults to your login); it is kept in
+  `~/.config/spectre/settings.json`.
 
 ## Hyprland / Omarchy
 
