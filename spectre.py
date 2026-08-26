@@ -2532,8 +2532,8 @@ class Game:
 
     def draw_radar(self):
         surf, view, p = self.screen, self.view, self.player
-        cx, cy = int(view.w / 2), int(view.h - 62)
-        r = 54
+        cx, cy = int(view.w / 2), int(view.h - 122)
+        r = 108
         pygame.draw.circle(surf, (16, 66, 50), (cx, cy), r, 1)
         pygame.draw.circle(surf, (12, 46, 36), (cx, cy), r * 2 // 3, 1)
         pygame.draw.line(surf, (12, 46, 36), (cx - r, cy), (cx + r, cy))
