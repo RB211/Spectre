@@ -1271,14 +1271,24 @@ class Audio:
 def lan_ip():
     """The address the LAN sees, found by aiming a datagram and reading
     the return address off the envelope.  Nothing is actually sent."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("10.255.255.255", 1))
-        return s.getsockname()[0]
+    for probe in ("8.8.8.8", "10.255.255.255"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((probe, 53))
+            ip = s.getsockname()[0]
+            if not ip.startswith("127."):
+                return ip
+        except OSError:
+            pass
+        finally:
+            s.close()
+    try:                                # no route anywhere: ask the resolver
+        ip = socket.gethostbyname(socket.gethostname())
+        if not ip.startswith("127."):
+            return ip
     except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+        pass
+    return "127.0.0.1"
 
 
 class Peer:
@@ -2694,10 +2704,15 @@ class Game:
         self.text("LAN LOBBY", w / 2, h * 0.26, self.big, COL_WHITE,
                   anchor="midtop")
         if self.role == "host":
-            self.text("HOSTING ON %s  PORT %d" % (self.net.ip, PORT),
-                      w / 2, h * 0.26 + 56, self.small, COL_FLAG,
-                      anchor="midtop")
-        y = h * 0.26 + 110
+            self.text("PLAYERS JOIN THIS ADDRESS", w / 2, h * 0.26 + 52,
+                      self.small, (80, 190, 145), anchor="midtop")
+            self.text(self.net.ip, w / 2, h * 0.26 + 74, self.big,
+                      COL_FLAG, anchor="midtop")
+            self.text("port %d" % PORT, w / 2, h * 0.26 + 118, self.small,
+                      (70, 160, 125), anchor="midtop")
+            y = h * 0.26 + 158
+        else:
+            y = h * 0.26 + 110
         for pid, name in self.roster or [[self.my_pid, self.my_name]]:
             col = PLAYER_COLS[pid % len(PLAYER_COLS)]
             tag = "  (you)" if pid == self.my_pid else ""
