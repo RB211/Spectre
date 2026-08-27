@@ -294,11 +294,20 @@ class Part:
         return clone
 
 
+def split_plane(a, b):
+    """A face plane of `a` with all of `b` on the far side, or None."""
+    for (nx, ny, nz), c in zip(a.normals, a.centers):
+        d = nx * c[0] + ny * c[1] + nz * c[2]
+        if all(nx * v[0] + ny * v[1] + nz * v[2] >= d - 1e-6 for v in b.verts):
+            return (nx, ny, nz), d
+    return None
+
+
 class Shape:
     """A drawable object: convex lumps, plus wires for the bits too thin to
     be worth making solid -- aerials, rings, guy lines."""
 
-    __slots__ = ("parts", "wires", "radius")
+    __slots__ = ("parts", "wires", "radius", "splits")
 
     def __init__(self, parts=(), wires=(), scale=1.0):
         self.parts = [p.scaled(scale) for p in parts]   # always a fresh copy
@@ -306,6 +315,25 @@ class Shape:
             others = [q for q in self.parts if q is not part and not q.two_sided]
             if others:
                 part.seal_against(others)
+
+        # For every pair of lumps, keep a face plane that separates them.
+        # Sorting lumps by centre distance is nearly right, but a long lump
+        # beside a tall one lands in the wrong order at a grazing angle --
+        # which side of the touching plane the eye is on never lies, and it
+        # is one dot product per pair at draw time.  Convention: the second
+        # lump of the pair lives on the plane's positive side.
+        self.splits = []
+        for i, a in enumerate(self.parts):
+            for j in range(i + 1, len(self.parts)):
+                plane = split_plane(a, self.parts[j])
+                if plane is None:
+                    plane = split_plane(self.parts[j], a)
+                    if plane is not None:
+                        (nx, ny, nz), d = plane
+                        plane = (-nx, -ny, -nz), -d
+                if plane is not None:
+                    self.splits.append((i, j) + plane)
+
         self.wires = [tuple(tuple(c * scale for c in p) for p in seg)
                       for seg in wires]
         pts = [v for p in self.parts for v in p.verts]
@@ -393,16 +421,18 @@ def player_shape(scale=1.0):
 def hunter_shape(scale=1.0):
     """Lean, nosed forward, all lance -- the tank that comes for you."""
     w = 0.58
+    base = [(-w, 0.12, -1.00), (w, 0.12, -1.00), (w, 0.12, 0.50),
+            (0.0, 0.12, 1.30), (-w, 0.12, 0.50)]
+    # The deck is the footprint scaled down, so every wall is a flat
+    # trapezoid: a twisted quad culls wrongly and tears at the silhouette.
+    deck = [(x * 0.72, 0.60, z * 0.72) for x, _, z in base]
     parts = [
-        prismoid([(-w, 0.12, -1.00), (w, 0.12, -1.00), (w, 0.12, 0.50),
-                  (0.0, 0.12, 1.30), (-w, 0.12, 0.50)],
-                 [(-0.44, 0.60, -0.82), (0.44, 0.60, -0.82), (0.44, 0.60, 0.34),
-                  (0.0, 0.60, 0.88), (-0.44, 0.60, 0.34)]),
+        prismoid(base, deck),
         box_part(-0.07, 0.07, 0.48, 0.62, 1.15, 1.95),      # lance
     ]
     for side in (-1, 1):
         parts.append(box_part(side * w, side * (w + 0.18), 0.0, 0.26, -1.05, 1.05))
-    wires = [((0.0, 0.60, -0.82), (0.0, 1.45, -1.05))]      # aerial
+    wires = [((0.0, 0.60, -0.72), (0.0, 1.45, -0.95))]      # aerial
     return Shape(parts, wires, scale)
 
 
@@ -519,12 +549,34 @@ class View:
 
         parts = shp.parts
         if len(parts) > 1:                  # lumps still need ordering
-            def far_first(part):
-                px = x + part.center[0] * c + part.center[2] * s
-                pz = z - part.center[0] * s + part.center[2] * c
-                py = y + part.center[1]
-                return -((px - ex) ** 2 + (py - ey) ** 2 + (pz - ez) ** 2)
-            parts = sorted(parts, key=far_first)
+            # The eye in model space, then farthest lump first -- but let
+            # the split planes overrule the distances: the lump whose side
+            # of the plane the eye is on must be painted after the other.
+            mex = (ex - x) * c - (ez - z) * s
+            mey = ey - y
+            mez = (ex - x) * s + (ez - z) * c
+            order = sorted(range(len(parts)), key=lambda i: -(
+                (mex - parts[i].center[0]) ** 2
+                + (mey - parts[i].center[1]) ** 2
+                + (mez - parts[i].center[2]) ** 2))
+            if shp.splits:
+                before = {i: set() for i in order}   # lumps owed a head start
+                for i, j, (nx, ny, nz), d in shp.splits:
+                    if nx * mex + ny * mey + nz * mez > d:
+                        before[j].add(i)
+                    else:
+                        before[i].add(j)
+                done, laid = set(), []
+                while len(laid) < len(parts):
+                    pick = next((k for k in order
+                                 if k not in done and before[k] <= done), None)
+                    if pick is None:                 # tangled: trust distance
+                        laid += [k for k in order if k not in done]
+                        break
+                    done.add(pick)
+                    laid.append(pick)
+                order = laid
+            parts = [parts[i] for i in order]
 
         if shp.wires:
             # Wires first: a mast or an aerial is attached to the solid, so
@@ -2644,10 +2696,14 @@ class Game:
                 if 0.0 <= px < w and 0.0 <= py < h:
                     surf.set_at((int(px), int(py)), COL_STAR)
         view.segments(floor_grid(0.0, 0.0), COL_GRID)
-        view.shape(TITLE_SHAPE, 0.0, 0.0, t * 0.55, COL_HUD,
-                   y=0.2, width=2, glow=True)
-        view.shape(FLAG_SHAPE, 13.0, -7.0, -t * 1.1, COL_FLAG,
-                   width=2, glow=True)
+        # Far to near, like the arena: when the orbit swings the flag round
+        # the back, the tank must be free to paint over it.
+        props = ((TITLE_SHAPE, 0.0, 0.0, t * 0.55, COL_HUD, 0.2),
+                 (FLAG_SHAPE, 13.0, -7.0, -t * 1.1, COL_FLAG, 0.0))
+        for shp, x, z, yaw, col, y in sorted(
+                props, key=lambda p: -((p[1] - view.ex) ** 2
+                                       + (p[2] - view.ez) ** 2)):
+            view.shape(shp, x, z, yaw, col, y=y, width=2, glow=True)
         view.dim = 1.0
 
         self.text("S P E C T R E", w / 2, h * 0.14, font(58), COL_HUD, anchor="midtop")
