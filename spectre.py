@@ -8,12 +8,14 @@ filled with the background and only forward-facing edges are stroked, so a
 building hides what stands behind it -- Spectre's hidden-line trick, and the
 reason its arenas read as places rather than diagrams.
 
-    /usr/bin/python spectre.py        (pygame lives in the system python)
+    .venv/bin/python spectre.py       (see the README to set up .venv)
+    .venv/bin/python spectre.py --vr  in a headset, over OpenXR
 
     W / up      drive              space   fire
     S / down    reverse            shift   turbo
     A D / left right   turn        tab     radar range
     p  pause    f  fullscreen      esc  menu (main menu / quit)
+    F12  recenter the headset seat
 
 LAN play: one machine picks HOST A LAN GAME and reads out the address the
 lobby shows; the others pick JOIN A LAN GAME and type it in (port 35700).
@@ -37,12 +39,29 @@ import threading
 for _hint in ("SDL_APP_ID", "SDL_VIDEO_WAYLAND_WMCLASS", "SDL_VIDEO_X11_WMCLASS"):
     os.environ.setdefault(_hint, "spectre")
 
+# A headset binds to our GL context through GLX -- pyopenxr speaks only
+# XR_KHR_opengl_enable's Xlib binding -- and SDL on a Wayland desktop makes
+# EGL contexts, which the runtime refuses.  Under XWayland the window is a
+# GLX one; PyOpenGL, seeing a Wayland session, would still load its EGL
+# platform and hand the runtime a NULL display, so it is told too.  Both
+# must be settled before pygame or OpenGL is imported.
+if "--vr" in sys.argv and os.environ.get("DISPLAY"):
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+    os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
+# The headset paces the loop, so the window's buffer swap must not wait on
+# the desk monitor's refresh too -- a 60 Hz vsync would hold a 90 Hz
+# headset to 60.  Mesa and NVIDIA each read their own switch.
+if "--vr" in sys.argv:
+    os.environ.setdefault("vblank_mode", "0")
+    os.environ.setdefault("__GL_SYNC_TO_VBLANK", "0")
+
 try:
     import pygame
 except ImportError:                                        # pragma: no cover
-    sys.exit("spectre: this interpreter has no pygame.\n"
-             "        pygame is installed for the system python here -- try:\n"
-             "            /usr/bin/python spectre.py")
+    sys.exit("spectre: this interpreter has no pygame.  Set up the venv:\n"
+             "            python -m venv .venv\n"
+             "            .venv/bin/pip install -r requirements.txt\n"
+             "        and run .venv/bin/python spectre.py")
 
 # ---------------------------------------------------------------- settings --
 
@@ -103,6 +122,9 @@ SHOT_COLS = (COL_SHOT, COL_ESHOT, COL_SENTRY)
 
 TAU = math.pi * 2
 
+TITLE_MENU = ("ONE PLAYER", "HOST A LAN GAME", "JOIN A LAN GAME", "SETTINGS",
+              "QUIT")
+
 # The one thing worth remembering between sessions: what to call you.
 SETTINGS_PATH = os.path.expanduser("~/.config/spectre/settings.json")
 
@@ -150,6 +172,17 @@ def wrap(angle):
 
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
+
+
+class Held:
+    """The keyboard's pressed keys, with the headset's controllers
+    holding a few more down -- Player.drive reads either the same."""
+
+    def __init__(self, keys, held):
+        self.keys, self.held = keys, held
+
+    def __getitem__(self, key):
+        return self.keys[key] or key in self.held
 
 
 def clip_rect(x0, y0, x1, y1, w, h):
@@ -492,21 +525,51 @@ class View:
         self.cx, self.cy = self.w * 0.5, self.h * 0.5
         # FOV across the narrow axis: a window tiled tall and thin then widens
         # the view instead of squeezing it down to a letterbox slit.
-        self.f = (min(self.w, self.h) * 0.5) / math.tan(FOV * 0.5)
+        self.f = self.fy = (min(self.w, self.h) * 0.5) / math.tan(FOV * 0.5)
+
+    def set_frustum(self, left, right, down, up):
+        """A headset eye's lopsided frustum, as the tangents of its four
+        half-angles (left and down negative): the optical axis sits off
+        the image's middle, and each axis has its own scale.  `f` stays
+        the horizontal one, which is all the culls ask for."""
+        self.f = self.w / (right - left)
+        self.fy = self.h / (up - down)
+        self.cx = -left * self.f
+        self.cy = up * self.fy
 
     def set_camera(self, x, y, z, yaw, pitch=0.0):
         self.ex, self.ey, self.ez = x, y, z
         self.cyaw, self.syaw = math.cos(yaw), math.sin(yaw)
         self.cpit, self.spit = math.cos(pitch), math.sin(pitch)
+        self.to_cam = self._to_cam_turned
+
+    def set_eye(self, eye, right, up, forward):
+        """Aim the camera along any basis at all -- a head in a headset
+        rolls and nods as it likes.  The three axes are unit world
+        vectors."""
+        self.ex, self.ey, self.ez = eye
+        self.basis = (right, up, forward)
+        self.to_cam = self._to_cam_basis
 
     # -- transforms -------------------------------------------------------
-    def to_cam(self, p):
+    # to_cam is one of these two, picked by whoever aimed the camera last:
+    # the desk's yaw-and-pitch, or a headset eye's free basis.
+    def _to_cam_turned(self, p):
         rx = p[0] - self.ex
         ry = p[1] - self.ey
         rz = p[2] - self.ez
         xc = rx * self.cyaw - rz * self.syaw
         zc = rx * self.syaw + rz * self.cyaw
         return (xc, ry * self.cpit - zc * self.spit, zc * self.cpit + ry * self.spit)
+
+    def _to_cam_basis(self, p):
+        rx = p[0] - self.ex
+        ry = p[1] - self.ey
+        rz = p[2] - self.ez
+        (ax, ay, az), (bx, by, bz), (fx, fy, fz) = self.basis
+        return (rx * ax + ry * ay + rz * az,
+                rx * bx + ry * by + rz * bz,
+                rx * fx + ry * fy + rz * fz)
 
     def visible(self, x, y, z, radius):
         """Cheap bounding-sphere cull against the frustum."""
@@ -525,7 +588,7 @@ class View:
         x, y, z = self.to_cam(p)
         if z < NEAR or z > FAR:
             return None
-        return (self.cx + x / z * self.f, self.cy - y / z * self.f, z)
+        return (self.cx + x / z * self.f, self.cy - y / z * self.fy, z)
 
     # -- drawing ----------------------------------------------------------
     def segments(self, segs, color, width=1, glow=False):
@@ -634,8 +697,8 @@ class View:
                             a[1] + (b[1] - a[1]) * t, NEAR))
         if len(out) < 3:
             return None
-        f, ox, oy, w, h = self.f, self.cx, self.cy, self.w, self.h
-        scr = [(ox + q[0] / q[2] * f, oy - q[1] / q[2] * f) for q in out]
+        f, fy, ox, oy, w, h = self.f, self.fy, self.cx, self.cy, self.w, self.h
+        scr = [(ox + q[0] / q[2] * f, oy - q[1] / q[2] * fy) for q in out]
         xs = [q[0] for q in scr]
         ys = [q[1] for q in scr]
         if max(xs) < 0.0 or min(xs) > w or max(ys) < 0.0 or min(ys) > h:
@@ -650,7 +713,7 @@ class View:
     def cam_segments(self, segs, color, width=1, glow=False):
         """Clip to the near plane, project, and stroke."""
         surf, draw = self.surface, pygame.draw.line
-        f, ox, oy, w, h = self.f, self.cx, self.cy, self.w, self.h
+        f, fy, ox, oy, w, h = self.f, self.fy, self.cx, self.cy, self.w, self.h
         r0, g0, b0 = color
         dim = self.dim
         for a, b in segs:
@@ -668,8 +731,8 @@ class View:
             depth = (az + bz) * 0.5
             if depth > FAR:
                 continue
-            line = clip_rect(ox + a[0] / az * f, oy - a[1] / az * f,
-                             ox + b[0] / bz * f, oy - b[1] / bz * f, w, h)
+            line = clip_rect(ox + a[0] / az * f, oy - a[1] / az * fy,
+                             ox + b[0] / bz * f, oy - b[1] / bz * fy, w, h)
             if line is None:
                 continue
             k = (1.0 - depth / FAR) ** 0.8 * dim
@@ -1542,6 +1605,14 @@ class Game:
         self.esc_prev = ("title", 0.0)   # where esc came from, to go back to
         self.esc_sel = 0
         self.quit = False                # the menu asks main() to stop
+
+        # -- headset state, kept by spectre_vr's loop when --vr is on.
+        self.headset = False             # a headset is showing this frame
+        self.held = set()                # keys the controllers hold down
+        self.rumble = None               # (strength 0..1, ms) -> the hands
+        self.vr_recenter = False         # F12: take the head as the seat
+        self.vr_canvas = None            # the instruments, for the panes
+        self.vr_pieces = []              # (name, rect) on vr_canvas
         self.join_text = ""
         self.join_err = ""
         self.snap_t = 0.0
@@ -1671,9 +1742,9 @@ class Game:
         elif k == pygame.K_p and self.role is None and self.state in ("play", "paused"):
             self.state = "paused" if self.state == "play" else "play"
         elif self.state == "title" and k in (pygame.K_UP, pygame.K_w):
-            self.menu_sel = (self.menu_sel - 1) % 4
+            self.menu_sel = (self.menu_sel - 1) % len(TITLE_MENU)
         elif self.state == "title" and k in (pygame.K_DOWN, pygame.K_s):
-            self.menu_sel = (self.menu_sel + 1) % 4
+            self.menu_sel = (self.menu_sel + 1) % len(TITLE_MENU)
         elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
             if self.state == "title":
                 if self.menu_sel == 0:
@@ -1683,9 +1754,11 @@ class Game:
                 elif self.menu_sel == 2:
                     self.join_err = ""
                     self.state, self.state_t = "join_ip", 0.0
-                else:
+                elif self.menu_sel == 3:
                     self.name_text = self.my_name
                     self.state, self.state_t = "settings", 0.0
+                else:
+                    self.quit = True     # main() stops at the frame's end
             elif (self.state == "lobby" and self.role == "host"
                   and k != pygame.K_SPACE):
                 self.net_start_level(1)
@@ -1751,6 +1824,8 @@ class Game:
             self.net_fx("fire", x, z)
         p.kick = 0.045
         self.audio.play("fire")
+        if self.rumble:
+            self.rumble(0.35, 45)
 
     # -- the frame --------------------------------------------------------
     def update(self, dt):
@@ -1795,6 +1870,8 @@ class Game:
         alive = self.state == "play"        # a dead host still runs the world
         if alive:
             keys = pygame.key.get_pressed()
+            if self.held:
+                keys = Held(keys, self.held)
             if keys[pygame.K_SPACE]:
                 self.fire()
             p.cool = max(0.0, p.cool - dt)
@@ -1999,6 +2076,8 @@ class Game:
         p.shake = min(1.4, p.shake + shake)
         if amount > 3.0:
             self.audio.play("hit")
+        if self.rumble:
+            self.rumble(min(1.0, 0.3 + amount / 40.0), 140)
         if p.shields <= 0.0:
             p.shields = 0.0
             self.kill_player("TANK DESTROYED")
@@ -2407,8 +2486,14 @@ class Game:
         if self.state == "settings":
             self.draw_settings()
             return
-        self.draw_world()
-        self.draw_hud()
+        if not self.headset:
+            self.draw_world()
+            self.draw_hud()
+        elif self.state in ("play", "dead"):
+            # The world goes to each eye on its own; the instruments go
+            # onto panes.  Under a menu they stay out of it altogether,
+            # or the flight HUD would come up on the menu's own sheet.
+            self.draw_vr_hud()
         if self.state == "escmenu":
             self.draw_escmenu()
         elif self.state == "paused":
@@ -2435,34 +2520,58 @@ class Game:
         sway = math.sin(p.bob * 2.0) * 0.07 * min(1.0, abs(p.speed) / 12.0)
         jolt = p.shake * math.sin(p.shake * 60.0 + p.bob * 9.0) * 0.05
         if self.chase:
-            # Solids hide what is behind them, and that now includes the
-            # camera: pull the boom in rather than film the inside of a wall.
             dx, dz = p.forward
-            boom = 13.0
-            while boom > 3.0:
-                cx, cz = p.x - dx * boom, p.z - dz * boom
-                if (abs(cx) < ARENA - 1.0 and abs(cz) < ARENA - 1.0
-                        and not any(b.blocks(cx, cz, 1.5) for b in self.buildings)):
-                    break
-                boom -= 2.0
+            boom = self.boom()
             self.view.set_camera(p.x - dx * boom, 3.0 + 3.4 * boom / 13.0 + sway,
                                  p.z - dz * boom, p.yaw, -0.19 - p.kick + jolt)
         else:
             self.view.set_camera(p.x, EYE + sway, p.z, p.yaw + jolt * 0.5,
                                  -p.kick + jolt)
 
-    def draw_world(self):
+    def boom(self):
+        """How far back the chase camera may sit.  Solids hide what is
+        behind them, and that includes the camera: pull the boom in
+        rather than film the inside of a wall."""
+        p = self.player
+        dx, dz = p.forward
+        boom = 13.0
+        while boom > 3.0:
+            cx, cz = p.x - dx * boom, p.z - dz * boom
+            if (abs(cx) < ARENA - 1.0 and abs(cz) < ARENA - 1.0
+                    and not any(b.blocks(cx, cz, 1.5) for b in self.buildings)):
+                break
+            boom -= 2.0
+        return boom
+
+    def seat(self):
+        """Where a headset's head sits, as (x, y, z, yaw): the desk
+        camera without anything the head did not do itself -- no sway,
+        no recoil, no jolt, no downward tilt -- since a horizon that
+        moves on its own is what makes a stomach turn.  The chase seat
+        rides the same boom, level."""
+        p = self.player
+        if not self.chase:
+            return p.x, EYE, p.z, p.yaw
+        dx, dz = p.forward
+        boom = self.boom()
+        return (p.x - dx * boom, 3.0 + 3.4 * boom / 13.0, p.z - dz * boom,
+                p.yaw)
+
+    def draw_world(self, aim=True):
+        """The arena through the view's camera -- the desk's own, or with
+        aim=False whatever the caller set (a headset eye)."""
         view, surf = self.view, self.screen
         surf.fill(COL_BG)
-        self.camera()
+        if aim:
+            self.camera()
         view.dim = 1.0
 
-        f, cx, cy, w, h = view.f, view.cx, view.cy, view.w, view.h
+        f, fy, cx, cy, w, h = view.f, view.fy, view.cx, view.cy, view.w, view.h
         for star in self.stars:                       # a sky to fall short of
             x, y, z = view.to_cam(star)
             if z <= 1.0:
                 continue
-            px, py = cx + x / z * f, cy - y / z * f
+            px, py = cx + x / z * f, cy - y / z * fy
             if 0.0 <= px < w and 0.0 <= py < h:
                 surf.set_at((int(px), int(py)), COL_STAR)
 
@@ -2528,7 +2637,7 @@ class Game:
             k = int(clamp(max(p.flash * 6.0, p.shake * 0.7), 0.0, 1.0) * 120)
             pygame.draw.rect(surf, (k, k // 5, k // 6), (0, 0, w, h), 6)
 
-        self.crosshair()
+        self.crosshair(int(view.cx), int(view.cy))
 
         self.text("SCORE %07d" % p.score, 18, 14, self.mid)
         self.text("LEVEL %d" % self.level, w / 2, 14, self.mid, anchor="midtop")
@@ -2539,44 +2648,121 @@ class Game:
                   anchor="topright")
 
         base = h - 118
-        self.text("SHIELDS", 18, base, self.small)
-        frac = p.shields / SHIELD_MAX
-        col = COL_HUD if frac > 0.55 else (255, 210, 90) if frac > 0.25 else COL_WARN
-        self.bar(90, base - 2, 190, 15, frac, col)
-        self.text("TURBO", 18, base + 24, self.small)
-        self.bar(90, base + 22, 120, 11, p.turbo, COL_SHIELD)
-        self.text("AMMO %3d" % p.ammo, 18, base + 46, self.mid,
-                  COL_HUD if p.ammo > 5 else COL_WARN)
-
-        self.text("FLAGS %d/%d" % (self.flags_taken, self.flags_needed),
-                  w - 18, base, self.mid, COL_FLAG, anchor="topright")
-        if self.role is None:
-            self.text("TANKS", w - 18, base + 30, self.small, anchor="topright")
-            for i in range(max(0, p.lives)):
-                x = w - 26 - i * 20
-                pygame.draw.polygon(surf, COL_HUD, ((x, base + 56), (x - 7, base + 68),
-                                                    (x + 7, base + 68)), 1)
-        else:                                  # the squadron, not the lives
-            rows = [(self.my_pid, self.my_name, p.score)]
-            rows += [(r.pid, r.name, r.score) for r in self.remotes.values()]
-            y = base + 28
-            for pid, name, score in sorted(rows):
-                self.text("%-10s %6d" % (name, score), w - 18, y, self.small,
-                          PLAYER_COLS[pid % len(PLAYER_COLS)], anchor="topright")
-                y += 18
+        self.hud_status(18, base)
+        self.hud_tally(w - 18, base)
         self.text("v view    tab radar    p pause", w - 18, h - 20, self.tiny,
                   (48, 96, 78), anchor="bottomright")
 
-        self.draw_radar()
+        self.draw_radar(int(w / 2), int(h - 122))
 
         if self.msg_t > 0.0:
-            k = clamp(self.msg_t * 2.0, 0.0, 1.0)
-            col = tuple(int(c * k) for c in COL_HUD)
-            self.text(self.msg, w / 2, h * 0.30, self.mid, col, anchor="center")
+            self.hud_message(w / 2, h * 0.30)
 
-    def crosshair(self):
-        surf, view, p = self.screen, self.view, self.player
-        cx, cy = int(view.cx), int(view.cy)
+    # The instruments, each drawn onto self.screen from the point it is
+    # handed: the desk lays them round the window's edges, a headset hangs
+    # each on its own pane (draw_vr_hud).
+    def hud_status(self, x, y):
+        """Shields, turbo and ammunition, from the top left."""
+        p = self.player
+        self.text("SHIELDS", x, y, self.small)
+        frac = p.shields / SHIELD_MAX
+        col = COL_HUD if frac > 0.55 else (255, 210, 90) if frac > 0.25 else COL_WARN
+        self.bar(x + 72, y - 2, 190, 15, frac, col)
+        self.text("TURBO", x, y + 24, self.small)
+        self.bar(x + 72, y + 22, 120, 11, p.turbo, COL_SHIELD)
+        self.text("AMMO %3d" % p.ammo, x, y + 46, self.mid,
+                  COL_HUD if p.ammo > 5 else COL_WARN)
+
+    def hud_tally(self, x, y):
+        """Flags, and the lives left or the squadron's scores, hung from
+        the top right."""
+        p = self.player
+        self.text("FLAGS %d/%d" % (self.flags_taken, self.flags_needed),
+                  x, y, self.mid, COL_FLAG, anchor="topright")
+        if self.role is None:
+            self.text("TANKS", x, y + 30, self.small, anchor="topright")
+            for i in range(max(0, p.lives)):
+                tx = x - 8 - i * 20
+                pygame.draw.polygon(self.screen, COL_HUD,
+                                    ((tx, y + 56), (tx - 7, y + 68),
+                                     (tx + 7, y + 68)), 1)
+        else:                                  # the squadron, not the lives
+            rows = [(self.my_pid, self.my_name, p.score)]
+            rows += [(r.pid, r.name, r.score) for r in self.remotes.values()]
+            ty = y + 28
+            for pid, name, score in sorted(rows):
+                self.text("%-10s %6d" % (name, score), x, ty, self.small,
+                          PLAYER_COLS[pid % len(PLAYER_COLS)], anchor="topright")
+                ty += 18
+
+    def hud_message(self, x, y):
+        k = clamp(self.msg_t * 2.0, 0.0, 1.0)
+        col = tuple(int(c * k) for c in COL_HUD)
+        self.text(self.msg, x, y, self.mid, col, anchor="center")
+
+    # Each instrument's plate on the headset canvas.  The canvas is
+    # measured in pixels and spectre_vr decides how many make a degree, so
+    # the instruments keep their desk sizes and their desk fonts.
+    VR_PIECES = (("score", (0, 0, 250, 60)),
+                 ("clock", (260, 0, 190, 60)),
+                 ("status", (0, 120, 300, 86)),
+                 ("radar", (310, 120, 240, 240)),
+                 ("tally", (560, 120, 250, 110)),
+                 ("message", (0, 70, 700, 44)),
+                 ("reticle", (820, 120, 64, 64)))
+
+    def draw_vr_hud(self):
+        """The instruments for a headset: each on a plate of its own on
+        vr_canvas, listed in vr_pieces for spectre_vr to hang in front
+        of the eyes.  Tinted glass behind each, so print reads over the
+        arena; the reticle goes bare."""
+        if self.vr_canvas is None:
+            self.vr_canvas = pygame.Surface((1024, 384), pygame.SRCALPHA, 32)
+        canvas, p = self.vr_canvas, self.player
+        canvas.fill((0, 0, 0, 0))
+        hit = p.flash > 0.0 or p.shake > 0.25       # taking fire: the rims
+        k = clamp(max(p.flash * 6.0, p.shake * 0.7), 0.0, 1.0) if hit else 0.0
+        rim = tuple(int(a + (b - a) * k) for a, b in zip((30, 96, 70), COL_WARN))
+        screen, self.screen = self.screen, canvas
+        self.vr_pieces = []
+        try:
+            for name, box in self.VR_PIECES:
+                r = pygame.Rect(box)
+                if name == "message" and self.msg_t <= 0.0:
+                    continue
+                if name != "reticle":
+                    canvas.fill((4, 10, 14, 150), r)
+                    pygame.draw.rect(canvas, rim, r, 1)
+                if name == "score":
+                    self.text("SCORE %07d" % p.score, r.x + 12, r.y + 8, self.mid)
+                    self.text("LEVEL %d" % self.level, r.x + 12, r.y + 34,
+                              self.small)
+                elif name == "clock":
+                    low = self.time_left < 20.0
+                    t = int(self.time_left)
+                    self.text("TIME %01d:%02d" % (t // 60, t % 60),
+                              r.right - 12, r.y + 8, self.mid,
+                              COL_WARN if low and int(self.time_left * 3) % 2
+                              else COL_HUD, anchor="topright")
+                    self.text("VIEW %s" % ("CHASE" if self.chase else "COCKPIT"),
+                              r.right - 12, r.y + 34, self.small,
+                              (70, 170, 130), anchor="topright")
+                elif name == "status":
+                    self.hud_status(r.x + 12, r.y + 14)
+                elif name == "radar":
+                    self.draw_radar(r.centerx, r.centery)
+                elif name == "tally":
+                    self.hud_tally(r.right - 12, r.y + 10)
+                elif name == "message":
+                    self.hud_message(r.centerx, r.centery)
+                elif name == "reticle":
+                    self.crosshair(r.centerx, r.centery)
+                self.vr_pieces.append((name, r))
+        finally:
+            self.screen = screen
+
+    def crosshair(self, cx, cy):
+        surf, p = self.screen, self.player
         locked = False
         for e in self.enemies:
             err = wrap(math.atan2(e.x - p.x, e.z - p.z) - p.yaw)
@@ -2592,9 +2778,8 @@ class Game:
         if locked:
             pygame.draw.rect(surf, col, (cx - 16, cy - 16, 32, 32), 1)
 
-    def draw_radar(self):
-        surf, view, p = self.screen, self.view, self.player
-        cx, cy = int(view.w / 2), int(view.h - 122)
+    def draw_radar(self, cx, cy):
+        surf, p = self.screen, self.player
         r = 108
         pygame.draw.circle(surf, (16, 66, 50), (cx, cy), r, 1)
         pygame.draw.circle(surf, (12, 46, 36), (cx, cy), r * 2 // 3, 1)
@@ -2709,26 +2894,28 @@ class Game:
         self.text("S P E C T R E", w / 2, h * 0.14, font(58), COL_HUD, anchor="midtop")
         self.text("wireframe tank arena", w / 2, h * 0.14 + 74, self.mid,
                   (70, 170, 130), anchor="midtop")
-        items = ("ONE PLAYER", "HOST A LAN GAME", "JOIN A LAN GAME",
-                 "SETTINGS")
         y = h - 276
-        for i, item in enumerate(items):
+        for i, item in enumerate(TITLE_MENU):
             on = i == self.menu_sel
             label = ("> %s <" % item) if on and int(t * 2.5) % 2 == 0 else item
             self.text(label, w / 2, y, self.mid,
                       COL_WHITE if on else (80, 190, 145), anchor="midtop")
             y += 32
-        rows = ["W S  drive    A D  turn    space  fire    shift  turbo",
-                "v  view    tab  radar    p  pause    esc  quit"]
-        y = h - 128
+        if self.headset:                 # the Touch controllers' names
+            rows = ["left stick  drive and turn    trigger  fire    grip  turbo",
+                    "A  select    B  back    Y  view    X  radar    L-stick click  recenter"]
+        else:
+            rows = ["W S  drive    A D  turn    space  fire    shift  turbo",
+                    "v  view    tab  radar    p  pause    esc  quit"]
+        y = h - 116
         for row in rows:
             self.text(row, w / 2, y, self.small, (70, 160, 125), anchor="midtop")
-            y += 24
+            y += 22
         if self.best:
-            self.text("BEST %d" % self.best, w / 2, h - 70, self.mid,
+            self.text("BEST %d" % self.best, w / 2, h - 66, self.mid,
                       COL_FLAG, anchor="midtop")
         if self.msg_t > 0.0:                    # a word from the network
-            self.text(self.msg, w / 2, h - 40, self.small, COL_WARN,
+            self.text(self.msg, w / 2, h - 34, self.small, COL_WARN,
                       anchor="midtop")
 
     def draw_net_screen(self):
@@ -2822,10 +3009,24 @@ def main(argv):
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         return 0
+    if "--vr-check" in argv:                     # is the headset side here?
+        try:
+            import spectre_vr
+        except ImportError as exc:
+            print("spectre: VR needs PyOpenGL and pyopenxr (%s)." % exc)
+            return 1
+        return spectre_vr.check()
     mute = "--mute" in argv
     frames = None
     if "--frames" in argv:                       # a smoke test, not a feature
         frames = int(argv[argv.index("--frames") + 1])
+    vr = None
+    if "--vr" in argv:
+        try:
+            import spectre_vr as vr
+        except ImportError as exc:
+            print("spectre: VR needs PyOpenGL and pyopenxr (%s);"
+                  " driving from the desk." % exc)
 
     if not mute:
         try:
@@ -2835,60 +3036,47 @@ def main(argv):
     pygame.init()
     pygame.display.set_caption("Spectre")
     flags = pygame.RESIZABLE | (pygame.FULLSCREEN if "--fullscreen" in argv else 0)
-    screen = pygame.display.set_mode((WIDTH, HEIGHT), flags)
+    if vr:
+        # The window becomes a GL mirror of the headset; the game draws
+        # onto a surface of its own, which the mirror shows.
+        pygame.display.set_mode((WIDTH, HEIGHT),
+                                flags | pygame.OPENGL | pygame.DOUBLEBUF)
+        screen = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA, 32)
+    else:
+        screen = pygame.display.set_mode((WIDTH, HEIGHT), flags)
     pygame.mouse.set_visible(False)
 
     game = Game(screen, Audio(enabled=not mute))
     clock = pygame.time.Clock()
-    running = True
 
-    while running:
-        dt = min(0.05, clock.tick(FPS) / 1000.0)
+    if vr:
+        vr.run(game, clock, lambda: handle_events(game), frames)
+    else:
+        running = True
+        while running:
+            dt = min(0.05, clock.tick(FPS) / 1000.0)
 
-        # Whoever owns the window decides how big it is -- a tiling compositor
-        # very much included.  Read the size back, never argue with it: calling
-        # set_mode() in reply to a resize starts a fight the window manager
-        # always wins, and the window flickers for as long as it lasts.
-        surface = pygame.display.get_surface()
-        if surface is not None and surface.get_size() != (game.view.w, game.view.h):
-            game.screen = surface
-            game.view.set_surface(surface)
+            # Whoever owns the window decides how big it is -- a tiling
+            # compositor very much included.  Read the size back, never argue
+            # with it: calling set_mode() in reply to a resize starts a fight
+            # the window manager always wins, and the window flickers for as
+            # long as it lasts.
+            surface = pygame.display.get_surface()
+            if surface is not None and surface.get_size() != (game.view.w, game.view.h):
+                game.screen = surface
+                game.view.set_surface(surface)
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
+            running = handle_events(game)
+            game.update(dt)
+            game.draw()
+            pygame.display.flip()
+            if game.quit:                        # the esc menu said so
                 running = False
-            elif event.type == pygame.KEYDOWN:
-                if game.state in ("join_ip", "settings"):
-                    game.key(event)              # typing: letters are letters,
-                                                 # esc backs out
-                elif event.key in (pygame.K_ESCAPE, pygame.K_q):
-                    if game.state in ("play", "paused", "dead", "clear",
-                                      "over", "escmenu"):
-                        game.toggle_escmenu()    # raise the menu, or lower it
-                    elif game.net or game.state == "lobby":
-                        game.escape()            # leave the LAN, keep the app
-                    else:
-                        running = False          # esc on the title quits
-                elif event.key in (pygame.K_f, pygame.K_F11):
-                    try:
-                        pygame.display.toggle_fullscreen()
-                    except pygame.error:
-                        pass
-                elif event.key == pygame.K_v:
-                    game.chase = not game.chase
-                else:
-                    game.key(event)
 
-        game.update(dt)
-        game.draw()
-        pygame.display.flip()
-        if game.quit:                            # the esc menu said so
-            running = False
-
-        if frames is not None:
-            frames -= 1
-            if frames <= 0:
-                running = False
+            if frames is not None:
+                frames -= 1
+                if frames <= 0:
+                    running = False
 
     if game.net:                                 # hang up before leaving
         if game.role == "host":
@@ -2896,6 +3084,39 @@ def main(argv):
         game.net.close()
     pygame.quit()
     return 0
+
+
+def handle_events(game):
+    """Everything the window and the keyboard said since last frame.
+    False once it is time to go."""
+    running = True
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        elif event.type == pygame.KEYDOWN:
+            if game.state in ("join_ip", "settings"):
+                game.key(event)                  # typing: letters are letters,
+                                                 # esc backs out
+            elif event.key in (pygame.K_ESCAPE, pygame.K_q):
+                if game.state in ("play", "paused", "dead", "clear",
+                                  "over", "escmenu"):
+                    game.toggle_escmenu()        # raise the menu, or lower it
+                elif game.net or game.state == "lobby":
+                    game.escape()                # leave the LAN, keep the app
+                else:
+                    running = False              # esc on the title quits
+            elif event.key in (pygame.K_f, pygame.K_F11):
+                try:
+                    pygame.display.toggle_fullscreen()
+                except pygame.error:
+                    pass
+            elif event.key == pygame.K_v:
+                game.chase = not game.chase
+            elif event.key == pygame.K_F12:
+                game.vr_recenter = True          # the headset's seat is here
+            else:
+                game.key(event)
+    return running
 
 
 if __name__ == "__main__":

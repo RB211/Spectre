@@ -3,16 +3,36 @@
 A clone of *Spectre* (Velocity, 1991) — the wireframe tank arena — in pygame.
 It draws in line art, but with real **hidden-line removal**: solids are filled
 with the background and only their facing edges are stroked, so a building
-hides whatever stands behind it. Self-contained — one file, one dependency.
+hides whatever stands behind it. Self-contained — one file, one dependency —
+plus a second file, `spectre_vr.py`, that only a headset loads.
 
 ## Run it
 
-pygame is installed for the **system** python here, not mise's:
+Spectre runs from a venv of its own (the system python no longer carries
+pygame):
 
-    /usr/bin/python spectre.py
+    python -m venv .venv
+    .venv/bin/pip install -r requirements.txt
+    .venv/bin/python spectre.py
 
     --fullscreen   start full screen
     --mute         no sound
+    --vr           play in a headset (see below)
+    --vr-check     is the headset side all here? (no session opened)
+
+Only pygame is needed for the desk; PyOpenGL and pyopenxr are for `--vr`.
+
+### Install
+
+    ./install.sh               install, or update an earlier install
+    ./install.sh --uninstall   take it all back out
+
+The game is copied into `~/.local/share/spectre` with a Python of its own,
+so work in the checkout never breaks the installed copy; run it again to
+install what the checkout has now. It adds **Spectre** and **Spectre VR** to
+the app launcher (Super + Space). The VR launcher starts WiVRn if it is not
+running, and is listed in the WiVRn app on the Quest, so it can be started
+from inside the headset. Both log to `~/.local/state/spectre/`.
 
 ## Play
 
@@ -36,6 +56,42 @@ Clearing a level pays a time bonus and adds another tank to the arena.
 **Steering winds up.** A tap turns you about half a degree, for lining up a
 shot; hold the key and the rate climbs over about 0.85 s to a full 132°/s
 swing. Fine aim and fast turns off the same key, no modifier.
+
+## VR
+
+`--vr` puts you in the tank's seat through any OpenXR runtime — here that is
+**WiVRn** and a wireless Quest:
+
+    systemctl --user start wivrn       # if it is not running already
+    .venv/bin/python spectre.py --vr   # then start the WiVRn app on the Quest
+
+The game starts on the desk and plays there until the headset joins; the
+moment it does, the headset takes over and the window becomes a mirror of
+the left eye. If WiVRn restarts or the link drops mid-game, the desk plays
+on until the headset comes back. `--vr-check` reports whether a runtime
+answers and offers OpenGL, without waiting on a headset.
+
+**In the headset** your head is free in the tank — look out the side while
+it drives straight on. Where you sit when the session starts is the seat;
+press `F12` (or click the left stick) to take wherever your head is now as
+the seat, or hold the Quest's Meta button, which Spectre also follows. The
+gauges hang in two rows round your gaze — score, message and clock above,
+shields, radar and flags below — and follow your head, so the middle stays
+clear and they are a flick of the eyes away. The reticle hangs out on the
+gun line. Menus come up on one sheet in front of the tank.
+
+| Touch controller | |
+|---|---|
+| left stick | drive, reverse, turn (the right stick turns too) |
+| trigger | fire |
+| grip | turbo |
+| `A` / `B` | select / back — `B` or the menu button raises the esc menu in a game |
+| `Y` / `X` | first-person / chase camera, radar range |
+| right stick click | pause |
+| left stick click | recenter the seat |
+
+The keyboard keeps working throughout; typing a LAN address or a name still
+wants it.
 
 ## LAN play
 
@@ -73,6 +129,19 @@ Delete that line and `hyprctl reload` if you would rather have it tiled; the
 game copes either way, including in a tall, narrow tile.
 
 ## How it works
+
+- **Headset.** The software renderer draws each eye in turn — an eye at
+  Quest resolution takes under 2 ms, because the work is in the edges, not the
+  pixels — and each picture goes up to the runtime as a texture (no copy: GL
+  reads the surface's own pixels). `View.set_eye` aims the camera along any
+  basis, since a head rolls and nods, and `View.set_frustum` takes the eye's
+  lopsided field of view. The head rides relative to `Game.seat()`, the desk
+  camera without its sway, recoil and jolt: a horizon that moves by itself is
+  what turns a stomach. The gauges and menus cannot be pasted over each eye's
+  picture — an eye's frustum is lopsided, so its image's middle is not straight
+  ahead, and a flat overlay comes out double — so they hang as panes in the
+  tank's space and go through each eye's own matrix. A whole stereo frame,
+  game update included, is about 6 ms.
 
 - `View` — the whole renderer: world → camera → near-plane clip → perspective
   divide → screen clip → fogged line (Liang-Barsky) or filled face

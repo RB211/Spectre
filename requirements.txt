@@ -1,0 +1,7 @@
+# The game itself needs only pygame (pygame-ce preferred; a distro's pygame
+# works too -- the import name is the same).
+pygame-ce>=2.5
+# Only --vr needs these, plus an OpenXR runtime: WiVRn for a wireless Quest,
+# Monado, or SteamVR.  Without them the arena is driven from the desk.
+PyOpenGL>=3.1
+pyopenxr>=1.1

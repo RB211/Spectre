@@ -1,0 +1,34 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Play Spectre VR",
+            "type": "shell",
+            "command": "systemctl --user is-active --quiet wivrn || systemctl --user start wivrn; exec '${workspaceFolder}/.venv/bin/python' -u spectre.py --vr",
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": { "kind": "build", "isDefault": true },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true,
+                "focus": false
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Play Spectre",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/bin/python",
+            "args": ["-u", "spectre.py"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true,
+                "focus": false
+            },
+            "problemMatcher": []
+        }
+    ]
+}
