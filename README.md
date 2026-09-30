@@ -1,177 +1,206 @@
+<div align="center">
+
+<img src="docs/images/title.png" alt="The Spectre title screen: a wireframe tank and flag on a green grid" width="820">
+
 # Spectre
 
-A clone of *Spectre* (Velocity, 1991) — the wireframe tank arena — in pygame.
-It draws in line art, but with real **hidden-line removal**: solids are filled
-with the background and only their facing edges are stroked, so a building
-hides whatever stands behind it. Self-contained — one file, one dependency —
-plus a second file, `spectre_vr.py`, that only a headset loads.
+**A wireframe tank arena, with hidden lines, LAN co-op and VR.**
 
-## Run it
+A clone of *Spectre* (Velocity, 1991), written from scratch in Python and pygame.
 
-Spectre runs from a venv of its own (the system python no longer carries
-pygame):
+[![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0-6fdc9a?style=flat-square)](LICENSE)
+[![Python 3](https://img.shields.io/badge/python-3-6fdc9a?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![pygame-ce](https://img.shields.io/badge/pygame--ce-2.5-6fdc9a?style=flat-square)](https://pyga.me/)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux-6fdc9a?style=flat-square&logo=linux&logoColor=white)](#install)
+[![VR: OpenXR](https://img.shields.io/badge/VR-OpenXR-ffcd46?style=flat-square)](#vr)
 
-    python -m venv .venv
-    .venv/bin/pip install -r requirements.txt
-    .venv/bin/python spectre.py
+[Install](#install) · [Play](#play) · [VR](#vr) · [LAN co-op](#lan-co-op) · [How it works](docs/how-it-works.md) · [Changelog](CHANGELOG.md)
 
-    --fullscreen   start full screen
-    --mute         no sound
-    --vr           play in a headset (see below)
-    --vr-check     is the headset side all here? (no session opened)
+</div>
 
-Only pygame is needed for the desk; PyOpenGL and pyopenxr are for `--vr`.
+---
 
-### Install
+Drive a vector tank round a walled arena, run down every flag before the clock
+does, and stay out of the sights of the tanks that come looking for you.
 
-    ./install.sh               install, or update an earlier install
-    ./install.sh --uninstall   take it all back out
+It's all line art, but the solids are solid: faces are filled with the
+background and only their front edges are drawn, so a building hides whatever
+stands behind it. That's the trick that made the original Spectre's arenas feel
+like places rather than diagrams. It's done here in software, in plain pygame,
+fast enough to draw twice per frame for a headset.
 
-The game is copied into `~/.local/share/spectre` with a Python of its own,
-so work in the checkout never breaks the installed copy; run it again to
-install what the checkout has now. It adds **Spectre** and **Spectre VR** to
-the app launcher (Super + Space). The VR launcher starts WiVRn if it is not
-running, and is listed in the WiVRn app on the Quest, so it can be started
-from inside the headset. Both log to `~/.local/state/spectre/`.
+<table>
+<tr>
+<td><img src="docs/images/cockpit.png" alt="Cockpit view: a red hunter tank in the crosshair, an explosion beside it, flags and pods across the arena"></td>
+<td><img src="docs/images/chase.png" alt="Chase view: the player's orange tank from behind, a red hunter and an explosion ahead between buildings"></td>
+</tr>
+<tr>
+<td align="center"><sub>Cockpit view</sub></td>
+<td align="center"><sub>Chase view (<code>v</code>)</sub></td>
+</tr>
+</table>
+
+## Features
+
+- **Hidden-line wireframe.** Filled faces, back-to-front painting, and seams
+  sealed where two solids meet. No OpenGL is needed to play on the desk.
+- **Enemies that hunt you.** Fast red **hunters** and slow, hard-hitting purple
+  **sentries** track you by sight and lead their shots. Keep a building between
+  you and them.
+- **Steering that winds up.** Tap for half a degree of fine aim; hold, and it
+  builds over 0.85 s to a full 132°/s swing, all on the same key.
+- **LAN co-op for up to four.** No accounts and no servers, just an address.
+  Levels are grown from a seed, so the arena is never sent over the network.
+- **VR over OpenXR.** Sit in the tank with your head free to look round.
+  Gauges hang in front of you, and the Touch controllers drive and fire.
+  Tested with a Quest 3 over [WiVRn](https://github.com/WiVRn/WiVRn).
+- **Synthesised sound.** Every effect is built at startup from oscillators and
+  noise, with no sample files. Sounds are positioned in stereo, so you can hear
+  which side the shots are coming from.
+- **Small.** One file for the game and a second only a headset loads.
+
+## Install
+
+Spectre is developed on Linux (Arch). The desk game is plain pygame and ought
+to run anywhere pygame does, but the installer and the VR setup are
+Linux-specific.
+
+```sh
+git clone https://github.com/RB211/Spectre.git
+cd Spectre
+./install.sh
+```
+
+This copies the game into `~/.local/share/spectre` with a Python environment of
+its own, and adds two entries to your app launcher:
+
+| Launcher | |
+|---|---|
+| **Spectre** | the game on your desktop |
+| **Spectre VR** | the game in a headset. It starts WiVRn if needed, and it's listed in the WiVRn app on the Quest, so you can start it from inside the headset. |
+
+Run `./install.sh` again to update, and `./install.sh --uninstall` to remove it.
+Your settings (`~/.config/spectre`) are kept. Logs go to
+`~/.local/state/spectre/`.
+
+<details>
+<summary><b>Run from source instead</b></summary>
+
+```sh
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python spectre.py
+```
+
+| Option | |
+|---|---|
+| `--fullscreen` | start full screen |
+| `--mute` | no sound |
+| `--vr` | play in a headset |
+| `--vr-check` | check the headset side is working, without starting a session |
+
+The desk game needs only pygame; PyOpenGL and pyopenxr are for `--vr`. In VS
+Code, **Ctrl+Shift+B** starts the game in VR.
+
+</details>
 
 ## Play
 
-| key | |
+Collect every flag in the arena before the clock runs out. Octahedral pods are
+ammunition and cubes are shields, and destroyed tanks drop them too. Clearing a
+level pays a time bonus and adds another enemy tank.
+
+| Key | |
 |---|---|
-| `W` `S` / `up` `down` | drive, reverse |
-| `A` `D` / `left` `right` | turn — taps are fine, holding winds up |
+| `W` `S` / `↑` `↓` | drive, reverse |
+| `A` `D` / `←` `→` | turn (tap to aim, hold to swing round) |
 | `space` | fire |
-| `shift` | turbo (drains, refills when you let off) |
-| `v` | first-person / chase camera |
-| `tab` | radar range: 55m / 90m / 150m |
-| `p` `f` | pause, fullscreen |
-| `esc` | in-game menu — back to the main menu, or quit (on the title it quits) |
-
-Collect every flag in the arena before the clock runs out. Enemy tanks —
-fast red **hunters** and slow, hard-hitting purple **sentries** — hunt you
-by sight and lead their shots, so keep buildings between you and them.
-Octahedral pods are ammunition, cubes are shields; kills drop them too.
-Clearing a level pays a time bonus and adds another tank to the arena.
-
-**Steering winds up.** A tap turns you about half a degree, for lining up a
-shot; hold the key and the rate climbs over about 0.85 s to a full 132°/s
-swing. Fine aim and fast turns off the same key, no modifier.
+| `shift` | turbo (drains while held, refills when you let go) |
+| `v` | switch between cockpit and chase camera |
+| `tab` | radar range: 55 m, 90 m or 150 m |
+| `p` | pause |
+| `f` | fullscreen |
+| `esc` | in-game menu (back to the main menu, or quit) |
 
 ## VR
 
-`--vr` puts you in the tank's seat through any OpenXR runtime — here that is
-**WiVRn** and a wireless Quest:
+<img src="docs/images/vr-stereo.png" alt="Both eyes of the headset view: the arena in stereo, with score and clock panels above the sight line and shields, radar and flags panels below" width="100%">
 
-    systemctl --user start wivrn       # if it is not running already
-    .venv/bin/python spectre.py --vr   # then start the WiVRn app on the Quest
+Spectre runs in any OpenXR headset whose runtime supports OpenGL. It's built
+and tested with a **Quest 3** streaming wirelessly over
+[**WiVRn**](https://github.com/WiVRn/WiVRn):
 
-The game starts on the desk and plays there until the headset joins; the
-moment it does, the headset takes over and the window becomes a mirror of
-the left eye. If WiVRn restarts or the link drops mid-game, the desk plays
-on until the headset comes back. `--vr-check` reports whether a runtime
-answers and offers OpenGL, without waiting on a headset.
+1. Start **Spectre VR** from the app launcher, or from the WiVRn app on the
+   Quest.
+2. If you started it on the PC, open the WiVRn app on the Quest. The game plays
+   in a window until the headset connects, then switches to it. The window then
+   mirrors the left eye.
 
-**In the headset** your head is free in the tank — look out the side while
-it drives straight on. Where you sit when the session starts is the seat;
-press `F12` (or click the left stick) to take wherever your head is now as
-the seat, or hold the Quest's Meta button, which Spectre also follows. The
-gauges hang in two rows round your gaze — score, message and clock above,
-shields, radar and flags below — and follow your head, so the middle stays
-clear and they are a flick of the eyes away. The reticle hangs out on the
-gun line. Menus come up on one sheet in front of the tank.
+**In the headset** your head is free inside the tank: look out the side while
+the tank drives straight on. The gauges hang in two rows around your gaze
+(score and clock above, shields, radar and flags below) so the middle stays
+clear. The reticle sits out on the gun line, and menus appear on a single
+sheet in front of you. Where you're sitting when the game starts becomes your
+seat; press `F12`, click the left stick, or hold the Quest's Meta button to
+recenter.
+
+If WiVRn restarts or the link drops, the game carries on in the window until
+the headset reconnects.
 
 | Touch controller | |
 |---|---|
-| left stick | drive, reverse, turn (the right stick turns too) |
+| left stick | drive, reverse and turn (the right stick turns too) |
 | trigger | fire |
 | grip | turbo |
-| `A` / `B` | select / back — `B` or the menu button raises the esc menu in a game |
-| `Y` / `X` | first-person / chase camera, radar range |
+| `A` / `B` | select / back (`B` or the menu button opens the in-game menu) |
+| `Y` | cockpit / chase camera |
+| `X` | radar range |
 | right stick click | pause |
-| left stick click | recenter the seat |
+| left stick click | recenter |
 
-The keyboard keeps working throughout; typing a LAN address or a name still
-wants it.
+You still need the keyboard to type a LAN address or your name.
 
-## LAN play
+## LAN co-op
 
-Co-op over the local network, up to four tanks, straight TCP on port 35700 —
-no accounts, no discovery service, just an address.
+Up to four tanks on the same network, over plain TCP on port 35700.
 
-- One machine picks **HOST A LAN GAME**; the lobby shows the address to read
-  out. The others pick **JOIN A LAN GAME** and type it in (`host:port` works
-  if you have moved the port). Everyone waits in the lobby until the host
-  presses `enter`.
-- The arena is never transmitted — a level is a **seed**, and every machine
-  grows the same buildings from it. The host owns the world (enemies, shells,
-  prizes, the clock) and streams it at 20 Hz; each player drives their own
-  tank locally and reports its pose at 30 Hz, so the controls never feel the
-  wire. Remote tanks are dead-reckoned between reports.
-- Flags and the clock are shared; scores are per player, and the enemy tanks
-  come for whoever is nearest. No friendly fire. Destroyed tanks respawn
-  after a moment — the mission only fails when the clock runs out, which
-  sends everyone back to the lobby for another go.
-- Every other tank flies its player's name over the turret, in that player's
-  color, fading with distance like everything else. Set yours under
-  **SETTINGS** on the title screen (it defaults to your login); it is kept in
-  `~/.config/spectre/settings.json`.
+1. One player picks **HOST A LAN GAME**. The lobby shows an address to read
+   out.
+2. Everyone else picks **JOIN A LAN GAME** and types it in (`host:port` works
+   if the port has been changed).
+3. The host presses `enter` when everyone's in.
 
-## Hyprland / Omarchy
+Flags and the clock are shared, scores are per player, and the enemy tanks go
+after whoever is nearest. There's no friendly fire. Destroyed tanks respawn
+after a moment, and the mission only fails when the clock runs out. Every other
+tank flies its player's name over the turret; set yours under **SETTINGS** on
+the title screen.
 
-The window announces itself as class `spectre` (via SDL's app-id hints, set
-before pygame imports), and never argues with the compositor about its own
-size — it reads the size back each frame and re-aims the camera. A rule in
-`~/.config/hypr/hyprland.lua` floats it instead of tiling it:
+## Tips
 
-    o.window("spectre", { float = true, center = true, size = { 1280, 800 } })
+**Tiling window managers.** The window's class is `spectre`, and it adapts to
+whatever size the compositor gives it, even a tall, narrow tile. To float it
+in Hyprland instead:
 
-Delete that line and `hyprctl reload` if you would rather have it tiled; the
-game copes either way, including in a tall, narrow tile.
+```lua
+o.window("spectre", { float = true, center = true, size = { 1280, 800 } })
+```
 
 ## How it works
 
-- **Headset.** The software renderer draws each eye in turn — an eye at
-  Quest resolution takes under 2 ms, because the work is in the edges, not the
-  pixels — and each picture goes up to the runtime as a texture (no copy: GL
-  reads the surface's own pixels). `View.set_eye` aims the camera along any
-  basis, since a head rolls and nods, and `View.set_frustum` takes the eye's
-  lopsided field of view. The head rides relative to `Game.seat()`, the desk
-  camera without its sway, recoil and jolt: a horizon that moves by itself is
-  what turns a stomach. The gauges and menus cannot be pasted over each eye's
-  picture — an eye's frustum is lopsided, so its image's middle is not straight
-  ahead, and a flat overlay comes out double — so they hang as panes in the
-  tank's space and go through each eye's own matrix. A whole stereo frame,
-  game update included, is about 6 ms.
+The renderer, the hidden-line trick, the synthesised audio, the networking
+and the VR pipeline are written up in
+**[docs/how-it-works.md](docs/how-it-works.md)**.
 
-- `View` — the whole renderer: world → camera → near-plane clip → perspective
-  divide → screen clip → fogged line (Liang-Barsky) or filled face
-  (Sutherland-Hodgman). Bounding-sphere culling per object.
-- **Hidden lines.** Models are convex lumps of faces (`Part`), wound outwards
-  at construction so one dot product per face says what you cannot see. Each
-  edge remembers the faces it borders and is stroked once if either faces you,
-  never if neither does. Lumps are built to touch, not overlap — two solids
-  that interpenetrate cannot be ordered back to front.
-- **Sealed seams.** Backface culling reasons about one convex lump at a time,
-  so where two of them meet — a cap on a roof, a turret on a deck, a barrel in
-  a breech — the lower one's top face is turned away and fills nothing, leaving
-  the upper one's underside showing through. `Part.seal_against` finds any face
-  whose every corner sits inside a neighbouring lump and never draws it. It is
-  computed at construction, not hand-listed, so new models get it for free.
-- **Wires go down before solids**, so a mast or an aerial attached to an object
-  is painted over by the half of the object standing in front of it.
-- **Painter's algorithm.** The floor grid goes down first, then every solid,
-  fence run, tracer and explosion sorted back to front each frame.
-- Busy level (34 buildings, 9 tanks): ~2.1 ms/frame at 1100x740, ~2.6 ms at
-  1600x1000; worst case, camera buried inside a building, 11 ms.
-- `Audio` synthesises every sound at startup (~150 ms) and renders it to raw
-  PCM — no sample files, no numpy. Layered oscillators over stepped
-  envelopes, plus white noise through a one-pole low pass, which is most of
-  what separates a rumble from a hiss. Two pitch variants of the common
-  sounds so repeated fire does not machine-gun.
-- **Positional sound.** The mixer runs in stereo and `Game.play_at` places a
-  sound in the world — attenuated by distance, panned to the side it came
-  from. You can hear which flank is shooting at you.
-- **Engine drone.** Six seamless loops, each built from exact harmonics of its
-  own base frequency and cut to a whole number of cycles, so the buffer's end
-  runs into its start with no seam. The band follows the throttle, with
-  hysteresis so it does not flutter at a boundary.
+## Credits
+
+*Spectre* was created by Velocity Development and published in 1991. This is
+an independent, from-scratch clone made for fun. It is not affiliated with or
+endorsed by the original's authors, and it contains none of their code or
+assets.
+
+## License
+
+Spectre is free software under the [GNU General Public License v3.0](LICENSE):
+you can use, study, share and change it, and anything you distribute that's
+built on it must be shared under the same terms.

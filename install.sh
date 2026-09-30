@@ -54,7 +54,7 @@ fi
 say "copying the game into $DEST"
 mkdir -p "$DEST"
 cp "$SRC/spectre.py" "$SRC/spectre_vr.py" "$SRC/requirements.txt" \
-   "$SRC/README.md" "$DEST/"
+   "$SRC/README.md" "$SRC/LICENSE" "$DEST/"
 
 # -- its own Python ---------------------------------------------------------
 if [[ ! -x $DEST/venv/bin/python ]]; then

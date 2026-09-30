@@ -25,6 +25,9 @@ gun line.
 Runtimes: WiVRn (a wireless Quest), Monado, or SteamVR -- whoever owns
 active_runtime.json.  pyopenxr's ContextObject does the handshake, handed
 SDL's live GLX context instead of opening a window of its own.
+
+Copyright (C) 2026 William Holland.  Free software under the GNU General
+Public License v3.0 -- see LICENSE.
 """
 
 import glob

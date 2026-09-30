@@ -22,6 +22,9 @@ lobby shows; the others pick JOIN A LAN GAME and type it in (port 35700).
 Everyone waits in the lobby until the host presses enter, then it is the
 same arena for all of you -- shared flags, shared clock, and the enemy
 tanks come for whoever is nearest.
+
+Copyright (C) 2026 William Holland.  Free software under the GNU General
+Public License v3.0 -- see LICENSE.
 """
 
 import json
