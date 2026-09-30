@@ -133,7 +133,8 @@ SETTINGS_PATH = os.path.expanduser("~/.config/spectre/settings.json")
 
 
 def default_name():
-    return (os.environ.get("USER") or "player").upper()[:10]
+    return (os.environ.get("USER") or os.environ.get("USERNAME")
+            or "player").upper()[:10]
 
 
 def load_settings():
@@ -3008,7 +3009,26 @@ def font(size):
 
 # ------------------------------------------------------------------- main --
 
+def log_to_file(argv):
+    """A windowed Windows build has no console, so anything printed would
+    vanish -- the headset's progress included.  Send it to a log instead,
+    in %LOCALAPPDATA%\\Spectre, a fresh one each run."""
+    if sys.stdout is not None:
+        return
+    folder = os.path.join(os.environ.get("LOCALAPPDATA")
+                          or os.path.expanduser("~"), "Spectre")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        name = "spectre-vr.log" if any(a.startswith("--vr") for a in argv) \
+            else "spectre.log"
+        sys.stdout = sys.stderr = open(os.path.join(folder, name), "w",
+                                       buffering=1, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def main(argv):
+    log_to_file(argv)
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         return 0

@@ -1,0 +1,162 @@
+# The Windows build: push a tag that starts with v -- or run this from the
+# Actions tab, naming a tag that already has a release -- and a Windows
+# runner freezes the game with PyInstaller, proves the build runs and
+# carries the headset side, wraps it in an Inno Setup installer, proves
+# the installer installs, runs and uninstalls, and attaches the installer
+# and a portable zip to that tag's release.
+name: Windows release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (its release is created if missing)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # PyOpenGL and pyopenxr come aboard too, so Spectre VR works straight
+      # from the installer; Pillow only turns the icons into .ico files.
+      - name: Install the game's dependencies and the freezer
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pillow
+
+      - name: Draw the icons
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: |
+          python tools/make_icon.py build/icons
+          python -c "from PIL import Image; [Image.open(f'build/icons/{n}.png').save(f'build/icons/{n}.ico', sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)]) for n in ('spectre', 'spectre-vr')]"
+
+      # Windowed: no console flashes up behind the game; what it prints goes
+      # to %LOCALAPPDATA%\Spectre instead (spectre.log_to_file).  PyOpenGL
+      # picks its platform back end by name at run time and pyopenxr finds
+      # its OpenXR loader DLL beside its own modules, so both are taken
+      # whole rather than left to the freezer's guesswork.  spectre_vr is
+      # imported only under --vr, so it is named outright.
+      - name: Freeze
+        run: >
+          pyinstaller --noconfirm --clean --windowed --name Spectre
+          --icon build/icons/spectre.ico --workpath build/pyinstaller
+          --hidden-import spectre_vr
+          --collect-submodules OpenGL --collect-data OpenGL
+          --collect-all xr
+          spectre.py
+
+      # A build that cannot draw a frame is not a release.  The runner has
+      # no screen and no sound card, so SDL gets its dummy drivers.  The
+      # windowed .exe does not hold the shell, so it is waited on.
+      - name: Prove it runs
+        shell: pwsh
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: |
+          $p = Start-Process dist/Spectre/Spectre.exe -ArgumentList "--mute", "--frames", "60" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the build would not run (exit $($p.ExitCode))" }
+
+      # The headset side, packed: the build must import pyopenxr and load
+      # its OpenXR loader DLL.  The runner has no runtime and no headset, so
+      # "no OpenXR runtime answered" is the right answer here; a missing
+      # module or DLL fails the build.
+      - name: Prove the VR side is aboard
+        shell: pwsh
+        run: |
+          Start-Process dist/Spectre/Spectre.exe -ArgumentList "--vr-check" -Wait
+          $log = Get-Content "$env:LOCALAPPDATA\Spectre\spectre-vr.log" -Raw
+          Write-Output $log
+          if ($log -notmatch "OpenXR loader: .*openxr_loader.*\.dll") {
+            throw "the OpenXR loader did not load"
+          }
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          $version = $env:TAG -replace '^v', ''
+          & $iscc "/DAppVersion=$version" packaging\windows\spectre.iss
+          if ($LASTEXITCODE -ne 0) { throw "the installer would not build" }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # The installer is proved the way a player uses it: installed without
+      # a prompt, the installed game run, then uninstalled clean.
+      - name: Prove the installer installs, runs and uninstalls
+        shell: pwsh
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: |
+          $setup = "dist/Spectre-$env:VERSION-windows-setup.exe"
+          Start-Process $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
+          $exe = "$env:LOCALAPPDATA\Programs\Spectre\Spectre.exe"
+          if (-not (Test-Path $exe)) { throw "the installer put nothing at $exe" }
+          $menu = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Spectre"
+          foreach ($link in "Spectre.lnk", "Spectre VR.lnk") {
+            if (-not (Test-Path "$menu\$link")) { throw "no Start menu entry $link" }
+          }
+          $p = Start-Process $exe -ArgumentList "--mute", "--frames", "30" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the installed game would not run" }
+          Start-Process "$env:LOCALAPPDATA\Programs\Spectre\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES" -Wait
+          Start-Sleep -Seconds 3
+          if (Test-Path $exe) { throw "the uninstaller left the game behind" }
+
+      - name: Zip a portable copy
+        shell: pwsh
+        run: |
+          Copy-Item README.md dist/Spectre/README.md
+          Copy-Item LICENSE dist/Spectre/LICENSE.txt
+          Set-Content -Path "dist/Spectre/Spectre VR.bat" -Encoding ascii -Value @(
+            '@echo off',
+            'rem Spectre in a headset: start Quest Link / Air Link or SteamVR first.',
+            'rem VR on Windows has not been tested yet.',
+            'cd /d "%~dp0"',
+            'start "" Spectre.exe --vr %*'
+          )
+          Compress-Archive -Path dist/Spectre -DestinationPath "dist/Spectre-$env:VERSION-windows-portable.zip"
+
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: Spectre-windows
+          path: |
+            dist/Spectre-*-windows-setup.exe
+            dist/Spectre-*-windows-portable.zip
+          retention-days: 14
+
+      # Onto the tag's release: added to it when it is already there (the
+      # notes stay as written), made with generated notes when it is not.
+      - name: Put it on the Releases page
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = "dist/Spectre-$env:VERSION-windows-setup.exe", "dist/Spectre-$env:VERSION-windows-portable.zip"
+          gh release view "$env:TAG" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "$env:TAG" @files --clobber
+          } else {
+            gh release create "$env:TAG" @files --title "Spectre $env:TAG" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw "could not publish to the release" }

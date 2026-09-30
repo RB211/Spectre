@@ -11,7 +11,7 @@ A clone of *Spectre* (Velocity, 1991), written from scratch in Python and pygame
 [![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0-6fdc9a?style=flat-square)](LICENSE)
 [![Python 3](https://img.shields.io/badge/python-3-6fdc9a?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![pygame-ce](https://img.shields.io/badge/pygame--ce-2.5-6fdc9a?style=flat-square)](https://pyga.me/)
-[![Platform: Linux](https://img.shields.io/badge/platform-Linux-6fdc9a?style=flat-square&logo=linux&logoColor=white)](#install)
+[![Platform: Linux | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-6fdc9a?style=flat-square)](#install)
 [![VR: OpenXR](https://img.shields.io/badge/VR-OpenXR-ffcd46?style=flat-square)](#vr)
 
 [Install](#install) · [Play](#play) · [VR](#vr) · [LAN co-op](#lan-co-op) · [How it works](docs/how-it-works.md) · [Changelog](CHANGELOG.md)
@@ -61,9 +61,24 @@ fast enough to draw twice per frame for a headset.
 
 ## Install
 
-Spectre is developed on Linux (Arch). The desk game is plain pygame and ought
-to run anywhere pygame does, but the installer and the VR setup are
-Linux-specific.
+### Windows
+
+Download **`Spectre-<version>-windows-setup.exe`** from the
+[latest release](https://github.com/RB211/Spectre/releases/latest) and run it.
+It installs for your user alone, with no administrator prompt, and adds
+**Spectre** and **Spectre VR** to the Start menu. It can be uninstalled from
+Settings → Apps. The installer isn't signed, so Windows SmartScreen will warn
+you the first time: choose **More info**, then **Run anyway**. There's also a
+portable zip on the release, if you'd rather not install.
+
+> **VR on Windows hasn't been tested yet.** It should work through Quest Link,
+> Air Link or SteamVR, but it has only been played on Linux so far. If you try
+> it, please [open an issue](https://github.com/RB211/Spectre/issues) and say
+> how it went. The game writes its log to `%LOCALAPPDATA%\Spectre`.
+
+### Linux
+
+Spectre is developed on Linux (Arch).
 
 ```sh
 git clone https://github.com/RB211/Spectre.git
@@ -127,8 +142,11 @@ level pays a time bonus and adds another enemy tank.
 <img src="docs/images/vr-stereo.png" alt="Both eyes of the headset view: the arena in stereo, with score and clock panels above the sight line and shields, radar and flags panels below" width="100%">
 
 Spectre runs in any OpenXR headset whose runtime supports OpenGL. It's built
-and tested with a **Quest 3** streaming wirelessly over
-[**WiVRn**](https://github.com/WiVRn/WiVRn):
+and tested on Linux with a **Quest 3** streaming wirelessly over
+[**WiVRn**](https://github.com/WiVRn/WiVRn). On Windows it should work through
+Quest Link, Air Link or SteamVR, but **VR on Windows hasn't been tested yet**.
+
+On Linux:
 
 1. Start **Spectre VR** from the app launcher, or from the WiVRn app on the
    Quest.

@@ -6,3 +6,8 @@ __pycache__/
 
 # The local interpreter (see README: Run it)
 .venv/
+
+# Build output (PyInstaller, Inno Setup, icons)
+build/
+dist/
+*.spec

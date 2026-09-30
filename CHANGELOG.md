@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.0.1 (2026-09-29)
+
+- **A Windows installer.** Each release now carries
+  `Spectre-<version>-windows-setup.exe`, built by GitHub Actions: a per-user
+  install with **Spectre** and **Spectre VR** in the Start menu, and an
+  uninstaller. There's also a portable zip.
+- **VR on Windows is included but hasn't been tested yet.** It should work
+  through Quest Link, Air Link or SteamVR.
+- On Windows the game writes its log to `%LOCALAPPDATA%\Spectre`, since it has
+  no console, and your default player name comes from your Windows login.
+
 ## v1.0.0 (2026-09-29)
 
 The first public release.
