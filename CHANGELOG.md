@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.2 (2026-09-30)
+
+- Windows VR now waits for the headset to become available and selects the
+  discrete GPU used by the OpenXR runtime. Ctrl+Shift+B uses an isolated
+  Windows Python environment; the Linux launch task is unchanged.
+
 ## v1.0.1 (2026-09-29)
 
 - **A Windows installer.** Each release now carries

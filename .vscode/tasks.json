@@ -6,6 +6,10 @@
             "type": "shell",
             "command": "systemctl --user is-active --quiet wivrn || systemctl --user start wivrn; exec '${workspaceFolder}/.venv/bin/python' -u spectre.py --vr",
             "options": { "cwd": "${workspaceFolder}" },
+            "windows": {
+                "command": "${workspaceFolder}\\.venv-win\\Scripts\\python.exe",
+                "args": ["-u", "spectre.py", "--vr"]
+            },
             "group": { "kind": "build", "isDefault": true },
             "presentation": {
                 "reveal": "always",

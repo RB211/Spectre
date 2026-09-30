@@ -51,6 +51,9 @@ for _hint in ("SDL_APP_ID", "SDL_VIDEO_WAYLAND_WMCLASS", "SDL_VIDEO_X11_WMCLASS"
 if "--vr" in sys.argv and os.environ.get("DISPLAY"):
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")
     os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
+# Keep the OpenGL window on the discrete GPU shared with the headset runtime.
+if "--vr" in sys.argv and sys.platform == "win32":
+    os.environ.setdefault("SHIM_MCCOMPAT", "0x800000001")
 # The headset paces the loop, so the window's buffer swap must not wait on
 # the desk monitor's refresh too -- a 60 Hz vsync would hold a 90 Hz
 # headset to 60.  Mesa and NVIDIA each read their own switch.

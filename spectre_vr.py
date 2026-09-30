@@ -57,6 +57,7 @@ RECENTER_SETTLE = 0.3
 # not back yet -- a server mid-restart -- for a new instance.
 LOST = (xr.exception.SessionLostError, xr.exception.InstanceLostError)
 REJOIN_RETRY = 3.0
+SYSTEM_RETRY = 1.0
 
 WAIT_HINT = ("start Quest Link / Air Link or SteamVR"
              if sys.platform == "win32"
@@ -144,12 +145,19 @@ class _SplitContext(xrgl.ContextObject):
 
     def enter_instance(self):
         """The blocking half: instance and system.  No GL, no SDL -- safe
-        off the main thread."""
+        off the main thread.  Windows runtimes can create an instance before
+        a headset is connected, then report FORM_FACTOR_UNAVAILABLE until it
+        comes online; keep asking while the desktop continues to play."""
         self.instance = xr.create_instance(
             create_info=self._instance_create_info)
-        self.system_id = xr.get_system(
-            instance=self.instance,
-            get_info=xr.SystemGetInfo(form_factor=self.form_factor))
+        while True:
+            try:
+                self.system_id = xr.get_system(
+                    instance=self.instance,
+                    get_info=xr.SystemGetInfo(form_factor=self.form_factor))
+                return
+            except xr.exception.FormFactorUnavailableError:
+                time.sleep(SYSTEM_RETRY)
 
     def poll_xr_events(self):
         """ContextObject's event pump, with an ear out for the one event it

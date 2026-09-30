@@ -144,7 +144,8 @@ level pays a time bonus and adds another enemy tank.
 Spectre runs in any OpenXR headset whose runtime supports OpenGL. It's built
 and tested on Linux with a **Quest 3** streaming wirelessly over
 [**WiVRn**](https://github.com/WiVRn/WiVRn). On Windows it should work through
-Quest Link, Air Link or SteamVR, but **VR on Windows hasn't been tested yet**.
+Quest Link, Air Link or SteamVR; Windows VR startup has now been verified on a
+laptop with an active OpenXR runtime.
 
 On Linux:
 
