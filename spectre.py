@@ -51,6 +51,24 @@ for _hint in ("SDL_APP_ID", "SDL_VIDEO_WAYLAND_WMCLASS", "SDL_VIDEO_X11_WMCLASS"
 if "--vr" in sys.argv and os.environ.get("DISPLAY"):
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")
     os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
+# Mesa gives the GLX context whichever GPU enumerated first, and with an
+# integrated one alongside the card that can change from boot to boot.  The
+# runtime composites on the discrete card, and swapchain images shared
+# across GPUs arrive as noise, so pin Mesa to the card with the most VRAM.
+if "--vr" in sys.argv and sys.platform.startswith("linux") \
+        and "DRI_PRIME" not in os.environ:
+    import glob as _glob
+    _cards = []
+    for _vram in _glob.glob("/sys/class/drm/renderD*/device/mem_info_vram_total"):
+        try:
+            with open(_vram) as _f:
+                _cards.append((int(_f.read()), os.path.basename(
+                    os.path.realpath(os.path.dirname(_vram)))))
+        except (OSError, ValueError):
+            pass
+    if len(_cards) > 1:
+        _pci = max(_cards)[1]
+        os.environ["DRI_PRIME"] = "pci-" + _pci.replace(":", "_").replace(".", "_")
 # Keep the OpenGL window on the discrete GPU shared with the headset runtime.
 if "--vr" in sys.argv and sys.platform == "win32":
     os.environ.setdefault("SHIM_MCCOMPAT", "0x800000001")

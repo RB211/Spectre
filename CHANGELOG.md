@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.3 (2026-09-30)
+
+- Fixed Linux VR showing coloured noise in the headset on PCs with both
+  integrated and discrete graphics. The game now renders on the GPU with the
+  most VRAM, the one the OpenXR runtime uses, instead of whichever GPU
+  registered first at boot. Setting `DRI_PRIME` yourself still overrides it.
+
 ## v1.0.2 (2026-09-30)
 
 - Windows VR now waits for the headset to become available and selects the
